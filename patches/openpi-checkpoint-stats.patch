@@ -1,0 +1,28 @@
+--- a/src/openpi/policies/policy_config.py
++++ b/src/openpi/policies/policy_config.py
+@@ -1,3 +1,4 @@
++import dataclasses
+ import logging
+ import os
+ import pathlib
+@@ -58,7 +59,19 @@
+         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+     else:
+         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
++    # Use inference checkpoint statistics before creating the data config.
++    # This avoids opening training demonstration metadata during serving.
++    if norm_stats is None and (checkpoint_dir / "assets" / "norm_stats.json").is_file():
++        norm_stats = _normalize.load(checkpoint_dir / "assets")
++    data_factory = train_config.data
++    if norm_stats is not None:
++        data_factory = dataclasses.replace(
++            data_factory,
++            base_config=dataclasses.replace(
++                data_factory.base_config or _config.DataConfig(), norm_stats=norm_stats
++            ),
++        )
++    data_config = data_factory.create(train_config.assets_dirs, train_config.model)
+     if norm_stats is None:
+         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
+         # that the policy is using the same normalization stats as the original training process.

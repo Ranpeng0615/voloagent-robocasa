@@ -2,6 +2,8 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 cd "$ROBOCASA_ROOT"
+python "$REPRO_CODE_DIR/scripts/configure_macros.py"
+python "$REPRO_CODE_DIR/scripts/apply_patches.py"
 if [[ ! -x envs/sim/bin/python || ! -x envs/policy/bin/python ]]; then uv python install 3.11; fi
 for name in sim policy; do
   [[ -x "envs/$name/bin/python" ]] || uv venv --python 3.11 "envs/$name"
