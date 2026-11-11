@@ -11,5 +11,6 @@ for name in sim policy; do
     -e repos/robosuite -e repos/robocasa -e repos/openpi/packages/openpi-client
 done
 uv pip install --python envs/policy/bin/python --index-url "$REPRO_PYPI_INDEX" -e repos/openpi
+uv pip install --python envs/policy/bin/python --index-url "$REPRO_PYPI_INDEX" chex==0.1.89
 uv pip install --python envs/sim/bin/python --index-url "$REPRO_PYPI_INDEX" \
   -e repos/VoLoAgent fastapi uvicorn httpx imageio-ffmpeg
