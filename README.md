@@ -47,7 +47,7 @@ Model revision metadata comes from the official Hugging Face repository. Model w
 ```bash
 source /root/autodl-tmp/robocasa-repro/code/scripts/env.sh
 python "$REPRO_CODE_DIR/scripts/configure_macros.py"
-envs/sim/bin/python code/scripts/run_episode.py --task PickPlaceCounterToStove --seed 7 --video
+"$ROBOCASA_ROOT/envs/sim/bin/python" "$REPRO_CODE_DIR/scripts/run_episode.py" --task PickPlaceCounterToStove --seed 7 --video
 ```
 
 The launcher loads the model, verifies an inference call, starts DeepSeek and VoLoAgent, then runs one native episode. All services it starts are stopped afterward. It writes the result, policy chunks, VLM requests and responses, final images, and video under `$ROBOCASA_ROOT/runs/`.
