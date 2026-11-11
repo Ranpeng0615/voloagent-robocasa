@@ -13,7 +13,7 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 export HF_HUB_DISABLE_XET=1
-export NO_PROXY=localhost,127.0.0.1
+export NO_PROXY=localhost,127.0.0.1,mirrors.aliyun.com,mirrors.tuna.tsinghua.edu.cn,repo.huaweicloud.com
 export no_proxy="$NO_PROXY"
 if [[ "${USE_LOCAL_PROXY:-1}" == 1 ]]; then
   export HTTP_PROXY="${REPRO_PROXY_URL:-http://127.0.0.1:17897}"
@@ -22,3 +22,4 @@ if [[ "${USE_LOCAL_PROXY:-1}" == 1 ]]; then
 fi
 export PATH="/root/miniconda3/bin:$PATH"
 export UV_HTTP_TIMEOUT=600
+export REPRO_PYPI_INDEX="${REPRO_PYPI_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
