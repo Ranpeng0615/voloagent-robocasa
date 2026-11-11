@@ -58,6 +58,14 @@ class DuplexControlTests(unittest.TestCase):
         for i in range(100): self.bus.publish({'step':i})
         self.assertEqual(self.bus.read()[0]['step'],99)
 
+    def test_dequeue_does_not_acknowledge_before_new_state_is_published(self):
+        command_id=self.bus.command({'command':'hold','tool':'hold'},0,5)
+        self.bus.take_commands()
+        self.assertLess(self.bus.acknowledged,command_id)
+        self.bus.publish({'step':6,'revision':1})
+        self.bus.acknowledge(command_id)
+        self.assertEqual(self.bus.acknowledged,command_id)
+
     def test_geometric_action_uses_native_rotated_base_frame(self):
         goal=Waypoint('approach',np.array([.02,0,0]),np.eye(3),1.)
         motion=MotionExecutor(ToolPlan('grasp',[goal],{}))

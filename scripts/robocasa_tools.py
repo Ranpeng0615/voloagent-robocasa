@@ -61,11 +61,25 @@ def make_plan(guide, snapshot, log, held_offset=None, client=None):
     name = guide['tool']
     target = guide['args']['target' if name == 'grasp' else 'destination']
     start = time.monotonic()
-    mask, score, box = client.detect_and_segment(snapshot['left'],target)
+    # The arm can occlude an external camera while the wrist sees the object.
+    # Try real calibrated views, keeping each RGB/mask/depth/pose pair aligned.
+    failures=[]
+    views=snapshot.get('views',{'left':{'rgb':snapshot['left'],'depth':snapshot['depth'],
+        'K':snapshot['K'],'T_camera':snapshot['T_camera']}})
+    for camera,view in views.items():
+        try:
+            mask,score,box=client.detect_and_segment(view['rgb'],target)
+            snapshot={**snapshot,**view,'left':view['rgb']}
+            break
+        except Exception as exc:
+            failures.append(camera+': '+str(exc))
+            log.emit('sam3_view_failed',camera=camera,revision=guide['revision'],error=str(exc))
+    else:
+        raise ValueError('No usable SAM3 target in available cameras: '+'; '.join(failures))
     center, obj_world = localize(snapshot,mask)
     log.emit('sam3_result',tool=name,target=target,score=score,mask_pixels=int(mask.sum()),box=box,
              duration_s=time.monotonic()-start,revision=guide['revision'])
-    evidence = {'target':target,'sam3_score':score,'mask_pixels':int(mask.sum()),'box':list(box),
+    evidence = {'target':target,'camera':camera,'sam3_score':score,'mask_pixels':int(mask.sum()),'box':list(box),
                 'observed_step':snapshot['step'],'perception_world_center':center.tolist()}
     artifacts=Path(os.environ['RUN_DIR'])/'tool_assets';artifacts.mkdir(exist_ok=True)
     prefix=artifacts/f'revision_{guide["revision"]}_{name}'
@@ -86,6 +100,12 @@ def make_plan(guide, snapshot, log, held_offset=None, client=None):
         # RoboCasa controls the grip SITE, not the Panda hand flange. Measure
         # this rigid robot-only transform from its model, rather than guessing.
         ee = hand@snapshot['T_hand_to_site']
+        # Parallel-jaw grasps are equivalent under a 180-degree roll about the
+        # approach axis. Choose the equivalent hand pose with less wrist twist.
+        alternate=hand.copy();alternate[:3,:3]=hand[:3,:3]@Rotation.from_euler('z',np.pi).as_matrix()
+        alternate_ee=alternate@snapshot['T_hand_to_site']
+        if np.linalg.norm(Rotation.from_matrix(alternate_ee[:3,:3]@r.T).as_rotvec()) < np.linalg.norm(Rotation.from_matrix(ee[:3,:3]@r.T).as_rotvec()):
+            ee=alternate_ee
         pos,rot = ee[:3,3],ee[:3,:3]
         approach = world[:3,2]
         pre = pos-approach*PRE_GRASP_OFFSET
@@ -122,6 +142,7 @@ class MotionExecutor:
         self.started = time.monotonic()
         self.reached = None
         self.status = 'moving'
+        self.tracking_error = {}
 
     @property
     def phase(self):
@@ -133,7 +154,11 @@ class MotionExecutor:
         goal = self.plan.waypoints[self.index]
         dp = goal.pos-snapshot['ee_pos']
         dr_world = Rotation.from_matrix(goal.rot@snapshot['ee_rot'].T).as_rotvec()
-        close_enough = np.linalg.norm(dp) < .009 and np.linalg.norm(dr_world) < .10
+        self.tracking_error={'position_m':float(np.linalg.norm(dp)),
+            'rotation_rad':float(np.linalg.norm(dr_world))}
+        position_tolerance=.009 if goal.phase in {'approach','close','lower','release'} else .020
+        rotation_tolerance=.12 if goal.phase in {'approach','close','lower','release'} else .20
+        close_enough = np.linalg.norm(dp) < position_tolerance and np.linalg.norm(dr_world) < rotation_tolerance
         now = time.monotonic()
         if close_enough:
             self.reached = self.reached or now

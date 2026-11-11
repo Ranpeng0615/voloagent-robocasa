@@ -27,6 +27,8 @@ class Exchange:
         self.snapshot = None
         self.guide = {'revision': 0, 'tool': 'vla', 'instruction': instruction, 'args': {}}
         self.commands = collections.deque()
+        self.command_seq = 0
+        self.acknowledged = 0
 
     def publish(self, snapshot):
         with self.condition:
@@ -39,8 +41,16 @@ class Exchange:
 
     def command(self, decision, based_revision, observed_step):
         with self.condition:
+            self.command_seq += 1
             self.commands.append({**decision, 'based_revision': based_revision,
-                                  'observed_step': observed_step, 'received_at': time.monotonic()})
+                                  'observed_step': observed_step, 'received_at': time.monotonic(),
+                                  'command_id': self.command_seq})
+            return self.command_seq
+
+    def acknowledge(self, command_id):
+        with self.condition:
+            self.acknowledged = max(self.acknowledged, command_id)
+            self.condition.notify_all()
 
     def take_commands(self):
         with self.condition:

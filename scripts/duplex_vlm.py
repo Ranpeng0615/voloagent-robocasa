@@ -57,7 +57,7 @@ stalls, or repeats a failed motion, actively consider grasp/place tools instead
 of repeatedly rewording the same instruction. Use SAM3/GraspGen only when the
 object is visible and the reachable geometric approach is appropriate. If a
 tool cannot detect the target, cannot converge, or cannot handle an articulated
-interaction, switch back to VLA with the specific unresolved goal. Do not force
+  interaction, switch back to VLA with the specific unresolved goal. Do not force
 every available tool to be used. Explain each switch using observed evidence.
 Compare the previous external image, when supplied, with the current images;
 robot motion alone is not proof that the object or task made progress.
@@ -126,11 +126,11 @@ def supervise(exchange, task, log):
                     break
                 memory = decision.get('memory',memory)
                 previous_view = (snapshot['step'],snapshot['left'])
-                exchange.command(decision,guide['revision'],snapshot['step'])
+                command_id=exchange.command(decision,guide['revision'],snapshot['step'])
                 # Wait for the execution loop to apply this decision before
                 # selecting the next latest frame. Never queue old snapshots.
                 with exchange.condition:
-                    exchange.condition.wait_for(lambda: not exchange.commands or exchange.stop.is_set(), timeout=.2)
+                    exchange.condition.wait_for(lambda: exchange.acknowledged>=command_id or exchange.stop.is_set())
             except Exception as exc:
                 log.emit('vlm_error', error=f'{type(exc).__name__}: {exc}',duration_s=time.monotonic()-tick)
                 exchange.stop.wait(.3)

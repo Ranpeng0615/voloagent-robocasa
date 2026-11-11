@@ -177,12 +177,19 @@ def main():
         state=np.concatenate([obs['state.end_effector_position_relative'],obs['state.end_effector_rotation_relative'],
             obs['state.base_position'],obs['state.base_rotation'],obs['state.gripper_qpos']]).astype(np.float32)
         _,guide=exchange.read()
-        return {'step':report['steps'],'vla_applied':report['vla_steps'],'wall_s':time.monotonic()-start,
+        views={}
+        for label,cam in [('left','robot0_agentview_left'),('right','robot0_agentview_right'),('wrist','robot0_eye_in_hand')]:
+            d=np.squeeze(obs['video.'+cam+'_depth'])
+            dm=(near/(1-np.clip(d,0,.999999)*(1-near/far))).astype(np.float32)
+            views[label]={'rgb':obs['video.'+cam],'depth':dm,
+                'K':get_camera_intrinsic_matrix(raw.sim,cam,h,w),
+                'T_camera':get_camera_extrinsic_matrix(raw.sim,cam)}
+        return {'step':report['steps'],'revision':guide['revision'],'vla_applied':report['vla_steps'],'wall_s':time.monotonic()-start,
             'left':obs['video.robot0_agentview_left'],'right':obs['video.robot0_agentview_right'],
             'wrist':obs['video.robot0_eye_in_hand'],'state':state,'depth':depth,
             'K':get_camera_intrinsic_matrix(raw.sim,'robot0_agentview_left',h,w),
             'T_camera':get_camera_extrinsic_matrix(raw.sim,'robot0_agentview_left'),
-            'ee_pos':ee[:3,3].copy(),'ee_rot':ee[:3,:3].copy(),
+            'views':views,'ee_pos':ee[:3,3].copy(),'ee_rot':ee[:3,:3].copy(),
             'T_hand_to_site':np.linalg.inv(hand)@ee,
             'controller_origin_rot':c.origin_ori.copy(),
             'controller_scale':((c.output_max-c.output_min)/(c.input_max-c.input_min)).copy(),
@@ -212,7 +219,8 @@ def main():
     log.emit('episode_begin',task=args.task,horizon=horizon,wall_limit_s=limit)
     try:
         while report['steps']<horizon and time.monotonic()-start<limit:
-            for command in exchange.take_commands():
+            commands=exchange.take_commands()
+            for command in commands:
                 applied=execution.apply(command,report['steps'])
                 if applied=='stop':
                     report['stopped_by_vlm']=True
@@ -260,6 +268,7 @@ def main():
                     log.emit('tool_motion_begin',tool=value.name,revision=guide['revision'],step=report['steps'],evidence=value.evidence)
             # Refresh robot/feedback state after command and result application.
             current=snapshot();exchange.publish(current)
+            for command in commands:exchange.acknowledge(command.get('command_id',0))
             if guide['tool']=='vla' and len(execution.actions)<=2 and not execution.vla_pending:
                 jobs.put_nowait((guide,current));execution.vla_pending=True
             if guide['tool'] in {'grasp','place'} and execution.motion is None and not execution.tool_pending and execution.phase in {'preparing','waiting_for_cancelled_inference'}:
@@ -278,7 +287,7 @@ def main():
                         event={'executor':guide['tool'],'args':guide['args'],
                                'status':execution.phase,'step':report['steps']}
                         execution.recent_events.append(event)
-                        log.emit('tool_motion_end',revision=guide['revision'],**event)
+                        log.emit('tool_motion_end',revision=guide['revision'],tracking_error=execution.motion.tracking_error,**event)
             execution.last_close=float(action[6])
             if video:
                 video.update(current['left'],{'step':report['steps'],'revision':guide['revision'],
@@ -293,7 +302,7 @@ def main():
             report['steps']+=1;report[source+'_steps']+=1
             report['success']=bool(info.get('success',False))
             log.emit('control_step',step=report['steps'],revision=guide['revision'],executor=source,
-                phase=execution.phase,action=action.tolist(),env_step_s=time.monotonic()-tick)
+                phase=execution.phase,action=action.tolist(),ee_world=current['ee_pos'].tolist(),env_step_s=time.monotonic()-tick)
             wall_state('running')
             if report['success']: break
             next_tick=max(next_tick+period,time.monotonic())
