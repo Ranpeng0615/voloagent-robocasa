@@ -10,7 +10,7 @@ def download_files(files,workers=24,block=32*1024*1024):
     pending=[];jobs=[]
     for entry in files:
         p=Path(entry['path']);p.parent.mkdir(parents=True,exist_ok=True)
-        if p.exists() and p.stat().st_size==entry['size']:
+        if p.exists() and p.stat().st_size==entry['size'] and not p.with_name(p.name+'.aria2').exists():
             if not entry.get('sha256') or hashlib.file_digest(p.open('rb'),'sha256').hexdigest()==entry['sha256']:
                 continue
         temp=p.with_name(p.name+'.partial')
