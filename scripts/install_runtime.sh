@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 cd "$ROBOCASA_ROOT"
-uv python install 3.11
+if [[ ! -x envs/sim/bin/python || ! -x envs/policy/bin/python ]]; then uv python install 3.11; fi
 for name in sim policy; do
   [[ -x "envs/$name/bin/python" ]] || uv venv --python 3.11 "envs/$name"
   uv pip install --python "envs/$name/bin/python" --index-url https://download.pytorch.org/whl/cpu \
