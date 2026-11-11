@@ -45,6 +45,7 @@ class Exchange:
             self.commands.append({**decision, 'based_revision': based_revision,
                                   'observed_step': observed_step, 'received_at': time.monotonic(),
                                   'command_id': self.command_seq})
+            self.condition.notify_all()
             return self.command_seq
 
     def acknowledge(self, command_id):
@@ -64,6 +65,12 @@ class Exchange:
                           'instruction': instruction, 'args': args}
             self.condition.notify_all()
             return dict(self.guide)
+
+    def describe(self, instruction):
+        """Update geometric-motion prose without invalidating unchanged work."""
+        with self.condition:
+            self.guide = {**self.guide, 'instruction':instruction}
+            self.condition.notify_all()
 
 
 class TimedVideo:

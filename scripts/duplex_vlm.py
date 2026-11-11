@@ -5,6 +5,7 @@ import json
 import time
 from PIL import Image
 import httpx
+from duplex_contract import validate_decision
 
 SYSTEM = '''You supervise a robot in RoboCasa. A separate executor CONTINUES moving
 while you reason. Each request contains a snapshot taken at observed_step; it is
@@ -36,7 +37,11 @@ Tools:
   supports; use vla for navigation/articulated or obstructed placements.
 - hold: retain position and last commanded gripper closure.
 
-continue retains the active execution and instruction. During a normal active
+continue with an unchanged instruction retains active execution. A changed VLA
+instruction is applied as refine: old queued actions are cleared and old
+inference results are invalidated. A changed tool or geometric target/destination
+is applied as switch_tool. For an unchanged geometric tool and args, changed
+descriptive text updates context without restarting its motion. During a normal active
 grasp/place motion, continue unless there is clear failure or wrong target.
 At awaiting_initial_guidance the robot is holding still; select a tool with
 switch_tool to begin. The task timer is already running.
@@ -61,6 +66,19 @@ tool cannot detect the target, cannot converge, or cannot handle an articulated
 every available tool to be used. Explain each switch using observed evidence.
 Compare the previous external image, when supplied, with the current images;
 robot motion alone is not proof that the object or task made progress.
+
+Feedback semantics: gripper.commanded is explicitly open or close in the native
+interface. gripper.measured describes finger separation, NOT object possession;
+holding_object remains unverified until you establish visual evidence. Never
+infer grasp success just from a close command or closed fingers. action_buffer
+is a rolling control buffer refilled by VLA, NOT a task/subgoal queue. Its length
+and draining do not indicate task progress. Do not wait for it to empty to verify
+a grasp. gripper_preview lists actual queued commands only. Read phase and
+last_guidance_result: failed/completed tools cannot resume with unchanged
+continue; choose the next executor or explicitly retry with switch_tool.
+Observation timestamps and frame ages describe input freshness. Images are fixed
+for this request; the robot may move during your reasoning. A command applied
+successfully is NOT evidence of task progress.
 '''
 
 
@@ -76,19 +94,7 @@ def parse_decision(text):
     if text.startswith('```'):
         text = text.split('\n',1)[1].rsplit('```',1)[0]
     value = json.loads(text)
-    if value.get('command') not in {'continue','refine','switch_tool','hold','stop'}:
-        raise ValueError('Invalid command')
-    if value.get('tool') not in {'vla','grasp','place','hold'}:
-        raise ValueError('Invalid tool')
-    if not isinstance(value.get('instruction',''),str) or not isinstance(value.get('args',{}),dict):
-        raise ValueError('Invalid instruction/args')
-    if value['command'] == 'refine' and value['tool'] != 'vla':
-        raise ValueError('refine is for VLA; use switch_tool to restart geometric tools')
-    if value['command'] == 'switch_tool':
-        field = {'grasp':'target','place':'destination'}.get(value['tool'])
-        if field and not isinstance(value.get('args',{}).get(field),str):
-            raise ValueError('Missing tool argument')
-    return value
+    return validate_decision(value)
 
 
 def supervise(exchange, task, log):
@@ -102,16 +108,19 @@ def supervise(exchange, task, log):
                 exchange.stop.wait(.03)
                 continue
             previous_step = snapshot['step']
-            feedback = {k:snapshot[k] for k in ('step','wall_s','feedback')}
             text = json.dumps({'task':task, 'observed_step':snapshot['step'],
-                'active':guide, 'feedback':feedback, 'memory':memory},ensure_ascii=False)
+                'observed_wall_s':snapshot['wall_s'],
+                'frame_age_at_pack_s':time.monotonic()-snapshot['captured_at_monotonic'],
+                'active':guide, 'feedback':snapshot['feedback'], 'memory':memory},ensure_ascii=False)
             content = [{'type':'text','text':text}]
             for name, label in [('left','Left external'),('right','Right external'),('wrist','Wrist')]:
                 content.extend(image_part(snapshot[name], label))
             if previous_view is not None:
                 content.extend(image_part(previous_view[1],f'Previous left external at step {previous_view[0]} (for progress comparison)'))
             tick = time.monotonic()
-            log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'])
+            log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'],
+                observed_wall_s=snapshot['wall_s'],captured_at_monotonic=snapshot['captured_at_monotonic'],
+                frame_age_s=tick-snapshot['captured_at_monotonic'])
             try:
                 response = client.post('http://127.0.0.1:8111/v1/chat/completions',json={
                     'model':'deepseek-flash','messages':[{'role':'system','content':SYSTEM},
@@ -121,7 +130,10 @@ def supervise(exchange, task, log):
                 decision = parse_decision(raw)
                 current, _ = exchange.read()
                 log.emit('vlm_end', observed_step=snapshot['step'], current_step=current['step'],
-                    revision=guide['revision'], duration_s=time.monotonic()-tick, decision=decision)
+                    revision=guide['revision'], duration_s=time.monotonic()-tick, decision=decision,
+                    input_frame_age_s=time.monotonic()-snapshot['captured_at_monotonic'],
+                    latest_frame_age_s=time.monotonic()-current['captured_at_monotonic'],
+                    current_phase=current['feedback']['phase'])
                 if exchange.stop.is_set():
                     break
                 memory = decision.get('memory',memory)

@@ -24,6 +24,7 @@ from robocasa.utils.dataset_registry_utils import get_task_horizon
 from robocasa.utils.env_utils import convert_action
 from robosuite.utils.camera_utils import get_camera_extrinsic_matrix, get_camera_intrinsic_matrix
 from duplex_core import EventLog, Exchange, TimedVideo
+from duplex_contract import executor_feedback, resolve_decision
 from duplex_vlm import supervise
 from robocasa_tools import make_plan, MotionExecutor
 
@@ -91,28 +92,42 @@ class ExecutionState:
         self.stale_results=0
         self.applied_commands=0
         self.recent_events=collections.deque(maxlen=8)
+        self.last_guidance_result=None
 
     def apply(self, command, step):
         _,guide=self.exchange.read()
         if command['based_revision']!=guide['revision']:
+            self.last_guidance_result={'status':'rejected','reason':'obsolete_revision'}
             self.log.emit('command_discarded',reason='obsolete_revision',step=step,command=command)
             return None
-        kind=command['command']
+        try:
+            resolved=resolve_decision(command,guide,self.phase)
+        except ValueError as exc:
+            self.last_guidance_result={'status':'rejected','reason':str(exc),'requested_command':command['command']}
+            self.log.emit('command_rejected',step=step,command=command,reason=str(exc))
+            return None
+        kind=resolved['command']
+        self.last_guidance_result={'status':'applied','requested_command':command['command'],
+            'effective_command':kind,'observed_step':command.get('observed_step'),
+            'applied_step':step}
         if kind=='continue':
-            self.log.emit('continue',step=step,revision=guide['revision'],reason=command.get('reason'))
+            self.exchange.describe(resolved['instruction'])
+            self.log.emit('continue',step=step,revision=guide['revision'],reason=command.get('reason'),
+                instruction=resolved['instruction'])
             return None
         if kind=='stop':
             self.log.emit('stop_command',step=step,command=command)
             return 'stop'
-        tool='hold' if kind=='hold' else command['tool']
+        tool=resolved['tool']
         previous=guide['revision']
-        guide=self.exchange.revise(tool,command.get('instruction') or guide['instruction'],command.get('args',{}))
+        guide=self.exchange.revise(tool,resolved['instruction'],resolved['args'])
         count=len(self.actions)
         self.actions.clear(); self.motion=None
         self.phase='holding' if tool=='hold' else 'preparing' if tool in {'grasp','place'} else 'awaiting_policy'
         self.applied_commands+=1
         self.log.emit('command_applied',step=step,previous_revision=previous,revision=guide['revision'],
-            cleared_actions=count,delivery_latency_s=time.monotonic()-command['received_at'],command=command)
+            cleared_actions=count,delivery_latency_s=time.monotonic()-command['received_at'],
+            effective_command=kind,command=command)
         return guide
 
     def hold(self):
@@ -140,6 +155,7 @@ def main():
     run=Path(os.environ['RUN_DIR']);run.mkdir(parents=True,exist_ok=True)
     env=gym.make(f'robocasa/{args.task}',split=args.split,seed=args.seed,camera_depths=True)
     obs,info=env.reset()
+    observed_at=time.monotonic()
     raw=env.unwrapped.env
     robot=raw.robots[0]
     c=robot.composite_controller.part_controllers['right']
@@ -186,7 +202,8 @@ def main():
             views[label]={'rgb':obs['video.'+cam],'depth':dm,
                 'K':get_camera_intrinsic_matrix(raw.sim,cam,h,w),
                 'T_camera':get_camera_extrinsic_matrix(raw.sim,cam)}
-        return {'step':report['steps'],'revision':guide['revision'],'vla_applied':report['vla_steps'],'wall_s':time.monotonic()-start,
+        return {'step':report['steps'],'revision':guide['revision'],'vla_applied':report['vla_steps'],
+            'wall_s':max(0.,observed_at-start),'captured_at_monotonic':observed_at,
             'left':obs['video.robot0_agentview_left'],'right':obs['video.robot0_agentview_right'],
             'wrist':obs['video.robot0_eye_in_hand'],'state':state,'depth':depth,
             'K':get_camera_intrinsic_matrix(raw.sim,'robot0_agentview_left',h,w),
@@ -195,11 +212,7 @@ def main():
             'T_hand_to_site':np.linalg.inv(hand)@ee,
             'controller_origin_rot':c.origin_ori.copy(),
             'controller_scale':((c.output_max-c.output_min)/(c.input_max-c.input_min)).copy(),
-            'feedback':{'executor':guide['tool'],'phase':execution.phase,'queued_actions':len(execution.actions),
-                'last_gripper_close_command':execution.last_close,'gripper_qpos':obs['state.gripper_qpos'].tolist(),
-                'vla_pending':execution.vla_pending,'tool_pending':execution.tool_pending,
-                'robot_ee_world':ee[:3,3].tolist(), 'motion_success_is_unverified':True,
-                'recent_executor_events':list(execution.recent_events)}}
+            'feedback':executor_feedback(guide,execution,obs['state.gripper_qpos'],ee[:3,3],hz)}
 
     def wall_state(phase):
         value={'phase':phase,'steps':report['steps'],'limit_s':limit,'elapsed_s':time.monotonic()-start,
@@ -300,6 +313,7 @@ def main():
                 if video: video.start(first_action)
             tick=time.monotonic()
             obs,reward,done,truncated,info=env.step(convert_action(action))
+            observed_at=time.monotonic()
             report['env_step_s']+=time.monotonic()-tick
             report['steps']+=1;report[source+'_steps']+=1
             report['success']=bool(info.get('success',False))

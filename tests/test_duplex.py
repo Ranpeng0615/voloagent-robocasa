@@ -1,5 +1,7 @@
 """Control invariants that matter when inference and motion overlap."""
 import sys
+import json
+import threading
 from pathlib import Path
 import tempfile
 import time
@@ -8,8 +10,9 @@ from unittest import mock
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from duplex_core import Exchange, EventLog, TimedVideo
-from duplex_vlm import parse_decision
-from run_duplex import ExecutionState
+from duplex_vlm import parse_decision, supervise
+from duplex_contract import executor_feedback
+from run_duplex import ExecutionState, policy_wire
 from robocasa_tools import MotionExecutor, ToolPlan, Waypoint, make_plan
 
 
@@ -58,6 +61,130 @@ class DuplexControlTests(unittest.TestCase):
     def test_latest_observation_replaces_old_one(self):
         for i in range(100): self.bus.publish({'step':i})
         self.assertEqual(self.bus.read()[0]['step'],99)
+
+    def test_continue_with_new_vla_instruction_applies_and_invalidates_old_work(self):
+        self.owner.actions.extend([np.ones(12) for _ in range(5)])
+        self.owner.vla_pending=True
+        guide=self.owner.apply(self.command('continue'),42)
+        self.assertEqual(guide['instruction'],'retry grasping bread')
+        self.assertEqual(guide['revision'],1)
+        self.assertFalse(self.owner.actions)
+        self.assertFalse(self.owner.accepts(0,'vla',43))
+        self.assertEqual(self.owner.last_guidance_result['effective_command'],'refine')
+        snap={key:np.zeros((16,16,3),np.uint8) for key in ['left','right','wrist']}
+        snap['state']=np.zeros(16)
+        self.assertEqual(policy_wire(snap,guide['instruction'])['prompt'],'retry grasping bread')
+
+    def test_unchanged_continue_keeps_buffer_and_inflight_work(self):
+        self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
+        self.owner.apply(self.command('continue',instruction=' pick   bread '),42)
+        self.assertEqual(self.bus.guide['revision'],0)
+        self.assertEqual(len(self.owner.actions),1)
+        self.assertTrue(self.owner.vla_pending)
+
+    def test_continue_tool_change_is_applied_as_switch(self):
+        guide=self.owner.apply(self.command('continue',tool='grasp',args={'target':'bread'}),42)
+        self.assertEqual(guide['tool'],'grasp')
+        self.assertEqual(self.owner.phase,'preparing')
+        self.assertEqual(self.owner.last_guidance_result['effective_command'],'switch_tool')
+
+    def test_continue_new_geometric_target_restarts_but_new_description_does_not(self):
+        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
+        motion=object();self.owner.motion=motion;self.owner.phase='approach'
+        self.owner.apply(self.command('continue',tool='grasp',revision=1,
+            instruction='Approach the bread carefully',args={'target':'bread'}),41)
+        self.assertIs(self.owner.motion,motion)
+        self.assertEqual(self.bus.guide['revision'],1)
+        self.assertEqual(self.bus.guide['instruction'],'Approach the bread carefully')
+        guide=self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'cheese'}),42)
+        self.assertEqual(guide['args'],{'target':'cheese'})
+        self.assertEqual(guide['revision'],2)
+        self.assertIsNone(self.owner.motion)
+
+    def test_unchanged_continue_cannot_resume_failed_or_finished_tool(self):
+        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
+        for phase in ['failed_above_target','motion_done_unverified']:
+            self.owner.phase=phase
+            self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'bread'}),41)
+            self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
+            self.assertEqual(self.bus.guide['revision'],1)
+            self.assertEqual(self.owner.phase,phase)
+
+    def test_continue_cannot_bypass_required_tool_arguments(self):
+        self.owner.apply(self.command('continue',tool='grasp'),42)
+        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
+        self.assertEqual(self.bus.guide['tool'],'vla')
+
+    def test_native_gripper_sign_and_rolling_buffer_are_explicit(self):
+        self.owner.last_close=-.999212
+        action=np.zeros(12);action[6]=.999
+        self.owner.actions.append(action)
+        feedback=executor_feedback(self.bus.guide,self.owner,[.039,-.039],[0,0,0],20)
+        self.assertEqual(feedback['gripper']['commanded'],'open')
+        self.assertEqual(feedback['gripper']['measured'],'open')
+        self.assertEqual(feedback['action_buffer']['gripper_preview'],['close'])
+        self.assertTrue(feedback['action_buffer']['auto_refilled'])
+        self.assertFalse(feedback['action_buffer']['indicates_task_progress'])
+        self.assertNotIn('last_gripper_close_command',feedback)
+        self.owner.last_close=.999
+        feedback=executor_feedback(self.bus.guide,self.owner,[.0014,-.0013],[0,0,0],20)
+        self.assertEqual(feedback['gripper']['commanded'],'close')
+        self.assertEqual(feedback['gripper']['measured'],'closed')
+        self.assertEqual(feedback['gripper']['holding_object'],'unverified')
+
+    def test_slow_vlm_does_not_block_capture_and_next_request_uses_latest_frame(self):
+        entered=threading.Event();release=threading.Event();second=threading.Event()
+        requests=[];errors=[]
+        def frame(step):
+            return {'step':step,'wall_s':step/20,'captured_at_monotonic':time.monotonic(),
+                'feedback':{'phase':'executing'},
+                **{k:np.full((16,16,3),step,np.uint8) for k in ['left','right','wrist']}}
+        def post(url,**kwargs):
+            requests.append(kwargs['json'])
+            if len(requests)==1:
+                entered.set()
+                if not release.wait(3): raise TimeoutError('Test did not release model response')
+            else:
+                second.set();self.bus.stop.set()
+            decision={'command':'continue','tool':'vla','instruction':'pick bread','args':{}}
+            response=mock.Mock()
+            response.json.return_value={'choices':[{'message':{'content':json.dumps(decision)}}]}
+            return response
+        def supervise_checked():
+            try: supervise(self.bus,'pick bread',self.log)
+            except Exception as exc: errors.append(exc)
+        self.bus.publish(frame(0))
+        with mock.patch('duplex_vlm.httpx.Client') as client:
+            client.return_value.__enter__.return_value.post.side_effect=post
+            thread=threading.Thread(target=supervise_checked,daemon=True);thread.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                for step in range(1,21): self.bus.publish(frame(step))
+                self.assertEqual(self.bus.read()[0]['step'],20)
+                self.assertEqual(json.loads(requests[0]['messages'][1]['content'][0]['text'])['observed_step'],0)
+                release.set()
+                with self.bus.condition:
+                    self.assertTrue(self.bus.condition.wait_for(lambda: bool(self.bus.commands),timeout=3))
+                command=self.bus.take_commands()[0]
+                self.owner.apply(command,20)
+                latest=frame(21);latest['feedback']['last_guidance_result']=self.owner.last_guidance_result
+                self.bus.publish(latest);self.bus.acknowledge(command['command_id'])
+                self.assertTrue(second.wait(3))
+            finally:
+                release.set();self.bus.stop.set()
+                with self.bus.condition:self.bus.condition.notify_all()
+                thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        next_input=json.loads(requests[1]['messages'][1]['content'][0]['text'])
+        self.assertEqual(next_input['observed_step'],21)
+        self.assertEqual(next_input['feedback']['last_guidance_result']['status'],'applied')
+        self.log.file.flush()
+        events=[json.loads(line) for line in (Path(self.temp.name)/'events.jsonl').read_text().splitlines()]
+        first_end=next(event for event in events if event['event']=='vlm_end')
+        self.assertEqual(first_end['observed_step'],0)
+        self.assertEqual(first_end['current_step'],20)
+        self.assertGreaterEqual(first_end['input_frame_age_s'],first_end['latest_frame_age_s'])
 
     def test_dequeue_does_not_acknowledge_before_new_state_is_published(self):
         command_id=self.bus.command({'command':'hold','tool':'hold'},0,5)
