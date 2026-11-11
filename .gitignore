@@ -1,0 +1,15 @@
+tools/
+work/
+.runtime/
+secrets/
+models/
+data/
+runs/
+cache/
+envs/
+repos/
+*.local.env
+.env
+*.key
+__pycache__/
+*.pyc
