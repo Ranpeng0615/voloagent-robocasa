@@ -1,5 +1,5 @@
 """Download official kitchen assets independently of simulator imports."""
-import concurrent.futures,json,os,subprocess,zipfile
+import concurrent.futures,json,os,subprocess,zipfile,shutil
 from pathlib import Path
 root=Path(os.environ.get('ROBOCASA_ROOT','/root/autodl-tmp/robocasa-repro'))
 assets=root/'repos/robocasa/robocasa/models/assets'
@@ -14,8 +14,15 @@ def get(item):
     url=links[key].replace('/s/','/shared/static/')+'.zip'
     archive=root/'data/downloads'/f'{key}.zip'
     archive.parent.mkdir(parents=True,exist_ok=True)
-    subprocess.run(['curl','--fail','--location','--retry','8','--retry-delay','3',
-                    '--continue-at','-','--output',str(archive),url],check=True)
+    if shutil.which('aria2c'):
+        command=['aria2c','--continue=true','--max-connection-per-server=8','--split=8',
+                 '--min-split-size=16M','--file-allocation=none','--max-tries=8',
+                 '--retry-wait=3','--summary-interval=30','--console-log-level=warn',
+                 '--dir',str(archive.parent),'--out',archive.name,url]
+    else:
+        command=['curl','--fail','--location','--retry','8','--retry-delay','3',
+                 '--continue-at','-','--output',str(archive),url]
+    subprocess.run(command,check=True)
     destination=(assets/target).parent
     destination.mkdir(parents=True,exist_ok=True)
     with zipfile.ZipFile(archive) as z:

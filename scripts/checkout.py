@@ -8,7 +8,7 @@ for name,spec in json.loads((code/'configs/upstreams.json').read_text()).items()
     if not (dest/'.git').exists():
         subprocess.run(['git','clone','--no-checkout',spec['url'],str(dest)],check=True)
     current=subprocess.run(['git','rev-parse','HEAD'],cwd=dest,capture_output=True,text=True)
-    if current.returncode or current.stdout.strip()!=spec['commit']:
+    if current.returncode or current.stdout.strip()!=spec['commit'] or not (dest/'.git/index').exists():
         subprocess.run(['git','fetch','origin',spec['commit']],cwd=dest,check=True)
         subprocess.run(['git','checkout','--detach',spec['commit']],cwd=dest,check=True)
     print(name,spec['commit'],flush=True)
