@@ -13,6 +13,14 @@ def validate_decision(value):
         raise ValueError('Invalid tool')
     if not isinstance(value.get('instruction',''), str) or not isinstance(value.get('args',{}), dict):
         raise ValueError('Invalid instruction/args')
+    if not isinstance(value.get('reason',''),str):
+        raise ValueError('Invalid visual evidence')
+    if value.get('progress','uncertain') not in {'normal','uncertain','stalled','failed'}:
+        raise ValueError('Invalid progress assessment')
+    if value.get('grasp_status','unverified') not in {'unverified','confirmed','failed','lost'}:
+        raise ValueError('Invalid grasp assessment')
+    if value.get('stage','other') not in {'acquire','transport','place','other'}:
+        raise ValueError('Invalid stage')
     if value['command']=='refine' and value['tool']!='vla':
         raise ValueError('refine is for VLA; use switch_tool to restart geometric tools')
     if value['command']=='switch_tool':
@@ -49,6 +57,21 @@ def resolve_decision(value, active, phase):
             raise ValueError('No active motion to continue; verify outcome and select/refine an executor')
     if kind=='switch_tool':
         validate_tool_args(tool,args)
+        if tool in {'grasp','place'}:
+            if value.get('observed_step')==0:
+                raise ValueError('Initial snapshot has no VLA execution history; observe progress before recovery tools')
+            if value.get('progress') not in {'stalled','failed'} or not str(value.get('reason','')).strip():
+                raise ValueError('Geometric tools require an observed anomaly or lack of progress')
+    # These are guards on the supervisor's declared visual assessment, not a
+    # detector of hidden VLA stages or an independent proof of object possession.
+    if kind not in {'stop','hold'}:
+        holding_confirmed=value.get('grasp_status')=='confirmed' and bool(value.get('reason','').strip())
+        if (value.get('stage') in {'transport','place'} or tool=='place') and not holding_confirmed:
+            kind,tool='hold','hold'
+            result['guard_reason']='holding_unverified; verify grasp before transport/place'
+        elif kind=='continue' and (value.get('progress')=='failed' or value.get('grasp_status') in {'failed','lost'}):
+            kind,tool='hold','hold'
+            result['guard_reason']='reported_failure_requires_recovery; unchanged continue blocked'
     result.update(command=kind,tool=tool,instruction=instruction,args=dict(args))
     return result
 
@@ -75,4 +98,5 @@ def executor_feedback(guide, execution, qpos, ee_world, control_hz):
         'robot_ee_world':[float(v) for v in ee_world],
         'motion_success_is_unverified':True,
         'last_guidance_result':execution.last_guidance_result,
+        'last_visual_assessment':execution.last_visual_assessment,
         'recent_executor_events':list(execution.recent_events)}

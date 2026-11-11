@@ -12,12 +12,16 @@ app=FastAPI()
 @app.on_event('shutdown')
 async def shutdown():await client.aclose()
 @app.get('/health')
-def health():return {'status':'ok','model':'deepseek-flash','reasoning_effort':'max'}
+def health():return {'status':'ok','model':'deepseek-flash','thinking_modes':['max','disabled']}
 @app.post('/v1/chat/completions')
 async def completion(body:dict):
     payload=dict(body)
-    payload.update(model='deepseek-flash',stream=False,reasoning_effort='max',thinking={'type':'enabled'})
-    for key in ('max_tokens','max_completion_tokens','stream_options'):payload.pop(key,None)
+    disabled=(body.get('thinking') or {}).get('type')=='disabled' or body.get('reasoning_effort')=='none'
+    payload.update(model='deepseek-flash',stream=False,
+        reasoning_effort='none' if disabled else 'max',
+        thinking={'type':'disabled' if disabled else 'enabled'})
+    # Preserve the short output cap used by subsequent monitoring requests.
+    for key in ('max_completion_tokens','stream_options'):payload.pop(key,None)
     folder=Path(os.environ.get('RUN_DIR',root/'runs'))/'deepseek_calls'/str(uuid.uuid4())
     folder.mkdir(parents=True)
     (folder/'request.json').write_text(json.dumps(payload))

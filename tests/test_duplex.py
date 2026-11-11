@@ -27,7 +27,10 @@ class DuplexControlTests(unittest.TestCase):
 
     def command(self, command, tool='vla', revision=0, **extra):
         return {'command':command,'tool':tool,'based_revision':revision,'received_at':time.monotonic(),
-                'instruction':'retry grasping bread','args':{},**extra}
+                'instruction':'retry grasping bread','args':{},
+                'progress':'stalled' if tool in {'grasp','place'} else 'normal',
+                'stage':'place' if tool=='place' else 'acquire','grasp_status':'unverified',
+                'reason':'Object remained on its support over repeated observations',**extra}
 
     def test_refine_flushes_immediately_without_waiting_for_inflight_vla(self):
         self.owner.actions.extend([np.ones(12) for _ in range(5)])
@@ -115,6 +118,53 @@ class DuplexControlTests(unittest.TestCase):
         self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
         self.assertEqual(self.bus.guide['tool'],'vla')
 
+    def test_geometric_tool_requires_reported_progress_problem(self):
+        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},progress='normal'),42)
+        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
+        self.assertEqual(self.bus.guide['tool'],'vla')
+
+    def test_initial_observation_cannot_replace_vla_with_geometric_tool(self):
+        self.owner.actions.append(np.ones(12))
+        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},
+            progress='failed',observed_step=0),42)
+        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
+        self.assertEqual(self.bus.guide['tool'],'vla')
+        self.assertEqual(len(self.owner.actions),1)
+
+    def test_failed_grasp_cannot_continue_unchanged_transport(self):
+        self.owner.actions.extend([np.ones(12) for _ in range(5)])
+        guide=self.owner.apply(self.command('continue',instruction='pick bread',
+            progress='failed',grasp_status='failed'),42)
+        self.assertEqual(guide['tool'],'hold')
+        self.assertFalse(self.owner.actions)
+        self.assertIn('reported_failure',self.owner.last_guidance_result['guard_reason'])
+
+    def test_unverified_transport_is_held_and_old_actions_invalidated(self):
+        self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
+        guide=self.owner.apply(self.command('refine',instruction='carry bread to bowl',
+            stage='transport',grasp_status='unverified'),42)
+        self.assertEqual(guide['tool'],'hold')
+        self.assertFalse(self.owner.actions)
+        self.assertFalse(self.owner.accepts(0,'vla',43))
+        self.assertIn('holding_unverified',self.owner.last_guidance_result['guard_reason'])
+
+    def test_failed_grasp_can_be_refined_back_to_acquisition(self):
+        guide=self.owner.apply(self.command('continue',instruction='open and regrasp bread only',
+            progress='failed',grasp_status='failed',stage='acquire'),42)
+        self.assertEqual(guide['tool'],'vla')
+        self.assertEqual(guide['instruction'],'open and regrasp bread only')
+        self.assertEqual(self.owner.last_guidance_result['effective_command'],'refine')
+
+    def test_confirmed_holding_allows_transport(self):
+        guide=self.owner.apply(self.command('refine',instruction='carry bread to bowl',
+            stage='transport',grasp_status='confirmed'),42)
+        self.assertEqual(guide['tool'],'vla')
+        self.assertEqual(guide['instruction'],'carry bread to bowl')
+
+    def test_place_tool_cannot_bypass_holding_requirement(self):
+        guide=self.owner.apply(self.command('switch_tool',tool='place',args={'destination':'bowl'}),42)
+        self.assertEqual(guide['tool'],'hold')
+
     def test_native_gripper_sign_and_rolling_buffer_are_explicit(self):
         self.owner.last_close=-.999212
         action=np.zeros(12);action[6]=.999
@@ -146,7 +196,8 @@ class DuplexControlTests(unittest.TestCase):
                 if not release.wait(3): raise TimeoutError('Test did not release model response')
             else:
                 second.set();self.bus.stop.set()
-            decision={'command':'continue','tool':'vla','instruction':'pick bread','args':{}}
+            decision={'command':'continue','tool':'vla','instruction':'pick bread','args':{},
+                'plan':['grasp bread','verify holding','place bread']}
             response=mock.Mock()
             response.json.return_value={'choices':[{'message':{'content':json.dumps(decision)}}]}
             return response
@@ -179,6 +230,13 @@ class DuplexControlTests(unittest.TestCase):
         next_input=json.loads(requests[1]['messages'][1]['content'][0]['text'])
         self.assertEqual(next_input['observed_step'],21)
         self.assertEqual(next_input['feedback']['last_guidance_result']['status'],'applied')
+        self.assertEqual(requests[0]['thinking'],{'type':'enabled'})
+        self.assertEqual(requests[0]['reasoning_effort'],'max')
+        self.assertEqual(requests[1]['thinking'],{'type':'disabled'})
+        self.assertEqual(requests[1]['reasoning_effort'],'none')
+        self.assertEqual(requests[1]['max_tokens'],1024)
+        self.assertEqual(next_input['request_kind'],'monitor')
+        self.assertEqual(next_input['initial_plan'],['grasp bread','verify holding','place bread'])
         self.log.file.flush()
         events=[json.loads(line) for line in (Path(self.temp.name)/'events.jsonl').read_text().splitlines()]
         first_end=next(event for event in events if event['event']=='vlm_end')

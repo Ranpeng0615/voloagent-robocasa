@@ -19,7 +19,39 @@ memory. You may decompose it into a few subgoals and track them in memory.
 Return ONLY JSON:
 {"command":"continue|refine|switch_tool|hold|stop",
  "tool":"vla|grasp|place|hold", "instruction":"current concrete instruction",
- "args":{}, "reason":"brief visible evidence", "memory":"compact task progress"}.
+ "args":{}, "progress":"normal|uncertain|stalled|failed",
+ "stage":"acquire|transport|place|other",
+ "grasp_status":"unverified|confirmed|failed|lost",
+ "reason":"brief visible evidence", "memory":"compact task progress",
+ "plan":["ordered subgoal; initial_plan request only"]}.
+
+For request_kind=initial_plan, establish a short ordered plan for the full task
+and return it in plan, but guide only the current unresolved stage. Later requests
+contain that saved initial_plan: do not rebuild it or repeat it in the output.
+For request_kind=monitor, directly assess current images and output a short
+decision. Keep reason under 30 words and memory under 100 words. A failed grasp
+must remain unresolved in memory until visual evidence establishes recovery.
+
+VLA IS THE DEFAULT EXECUTOR and starts immediately with the native task
+instruction. Your first request does not block it. At step 0 there is no motion
+history: normally continue VLA, do not choose geometric grasp just because an
+object is visible. Use grasp/place only for recovery when you observe an anomaly
+or insufficient progress; report progress=failed or stalled with concrete visible
+evidence. After recovery, return ordinary task execution to VLA.
+
+For a multi-stage task, guide only the current unresolved stage. Keep later
+stages in memory rather than combining grasp, transport and place into one
+instruction, including the first plan. Split each pick-and-place goal into
+acquire, verify holding, then transport/place. For stage=acquire, the instruction
+must stop at grasping and a small verification lift; do not include placing the
+target at its destination. If closed fingers are empty, explicitly open them
+before the retry. Before transport/place, require visual evidence that the
+target is held and follows the gripper; gripper closure or arm motion alone is
+not evidence. If the object remains behind, report grasp_status=failed or lost,
+return to stage=acquire, and refine/recover now. Do NOT continue a transport
+instruction after detecting a failed grasp. Unchanged continue with a reported
+failure is converted to hold. Transport/place without confirmed visual holding
+is also held. These checks cannot detect failures you have not observed.
 
 Tools:
 - vla: official RoboCasa pi05, accepts a language instruction and all 3 cameras.
@@ -43,8 +75,6 @@ inference results are invalidated. A changed tool or geometric target/destinatio
 is applied as switch_tool. For an unchanged geometric tool and args, changed
 descriptive text updates context without restarting its motion. During a normal active
 grasp/place motion, continue unless there is clear failure or wrong target.
-At awaiting_initial_guidance the robot is holding still; select a tool with
-switch_tool to begin. The task timer is already running.
 refine changes the current VLA instruction and invalidates its pending actions.
 switch_tool cancels the current executor and starts the selected tool. Changing
 from grasp to place (or changing object) requires switch_tool. Do not repeatedly
@@ -54,9 +84,8 @@ hold suspends motion. stop ends the episode only if the task is visibly complete
 or cannot continue; a simulator success check remains the evaluation authority.
 No simulator object coordinates, segmentation labels or success flags are given.
 
-SELECT EXECUTORS DYNAMICALLY. There is no fixed VLA/tool schedule, and picking
-does not automatically require a grasp tool. Choose whichever executor is most
-likely to advance the current stage. Keep VLA when it is making visible progress.
+SELECT RECOVERY EXECUTORS DYNAMICALLY. There is no fixed recovery tool schedule.
+Picking starts with VLA. Keep VLA when it is making visible progress.
 If it closes on empty space, leaves an object behind while starting transport,
 stalls, or repeats a failed motion, actively consider grasp/place tools instead
 of repeatedly rewording the same instruction. Use SAM3/GraspGen only when the
@@ -99,6 +128,7 @@ def parse_decision(text):
 
 def supervise(exchange, task, log):
     memory = ''
+    initial_plan = None
     previous_step = -1
     previous_view = None
     with httpx.Client(timeout=httpx.Timeout(60, connect=5), trust_env=False) as client:
@@ -108,9 +138,12 @@ def supervise(exchange, task, log):
                 exchange.stop.wait(.03)
                 continue
             previous_step = snapshot['step']
+            planning=initial_plan is None
+            request_kind='initial_plan' if planning else 'monitor'
             text = json.dumps({'task':task, 'observed_step':snapshot['step'],
                 'observed_wall_s':snapshot['wall_s'],
                 'frame_age_at_pack_s':time.monotonic()-snapshot['captured_at_monotonic'],
+                'request_kind':request_kind, 'initial_plan':initial_plan,
                 'active':guide, 'feedback':snapshot['feedback'], 'memory':memory},ensure_ascii=False)
             content = [{'type':'text','text':text}]
             for name, label in [('left','Left external'),('right','Right external'),('wrist','Wrist')]:
@@ -119,18 +152,27 @@ def supervise(exchange, task, log):
                 content.extend(image_part(previous_view[1],f'Previous left external at step {previous_view[0]} (for progress comparison)'))
             tick = time.monotonic()
             log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'],
+                request_kind=request_kind,thinking='max' if planning else 'disabled',
                 observed_wall_s=snapshot['wall_s'],captured_at_monotonic=snapshot['captured_at_monotonic'],
                 frame_age_s=tick-snapshot['captured_at_monotonic'])
             try:
-                response = client.post('http://127.0.0.1:8111/v1/chat/completions',json={
+                payload={
                     'model':'deepseek-flash','messages':[{'role':'system','content':SYSTEM},
-                    {'role':'user','content':content}], 'response_format':{'type':'json_object'}})
+                    {'role':'user','content':content}], 'response_format':{'type':'json_object'},
+                    'thinking':{'type':'enabled' if planning else 'disabled'},
+                    'reasoning_effort':'max' if planning else 'none'}
+                if not planning:payload['max_tokens']=1024
+                response = client.post('http://127.0.0.1:8111/v1/chat/completions',json=payload)
                 response.raise_for_status()
                 raw = response.json()['choices'][0]['message']['content']
                 decision = parse_decision(raw)
+                if planning:
+                    plan=decision.get('plan')
+                    initial_plan=plan if isinstance(plan,list) and plan and all(isinstance(s,str) and s.strip() for s in plan) else [task]
                 current, _ = exchange.read()
                 log.emit('vlm_end', observed_step=snapshot['step'], current_step=current['step'],
                     revision=guide['revision'], duration_s=time.monotonic()-tick, decision=decision,
+                    request_kind=request_kind,thinking='max' if planning else 'disabled',
                     input_frame_age_s=time.monotonic()-snapshot['captured_at_monotonic'],
                     latest_frame_age_s=time.monotonic()-current['captured_at_monotonic'],
                     current_phase=current['feedback']['phase'])

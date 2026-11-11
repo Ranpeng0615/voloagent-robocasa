@@ -93,6 +93,7 @@ class ExecutionState:
         self.applied_commands=0
         self.recent_events=collections.deque(maxlen=8)
         self.last_guidance_result=None
+        self.last_visual_assessment=None
 
     def apply(self, command, step):
         _,guide=self.exchange.read()
@@ -107,9 +108,11 @@ class ExecutionState:
             self.log.emit('command_rejected',step=step,command=command,reason=str(exc))
             return None
         kind=resolved['command']
+        self.last_visual_assessment={k:resolved.get(k) for k in ['progress','grasp_status','stage','reason']}
+        self.last_visual_assessment['observed_step']=command.get('observed_step')
         self.last_guidance_result={'status':'applied','requested_command':command['command'],
             'effective_command':kind,'observed_step':command.get('observed_step'),
-            'applied_step':step}
+            'applied_step':step,'guard_reason':resolved.get('guard_reason')}
         if kind=='continue':
             self.exchange.describe(resolved['instruction'])
             self.log.emit('continue',step=step,revision=guide['revision'],reason=command.get('reason'),
@@ -127,7 +130,7 @@ class ExecutionState:
         self.applied_commands+=1
         self.log.emit('command_applied',step=step,previous_revision=previous,revision=guide['revision'],
             cleared_actions=count,delivery_latency_s=time.monotonic()-command['received_at'],
-            effective_command=kind,command=command)
+            effective_command=kind,guard_reason=resolved.get('guard_reason'),command=command)
         return guide
 
     def hold(self):
@@ -166,15 +169,14 @@ def main():
     instruction=obs['annotation.human.task_description']
     log=EventLog(run/'duplex_events.jsonl')
     exchange=Exchange(instruction);execution=ExecutionState(exchange,log)
-    # Initial planning is counted in the task budget. Do not let an unguided
-    # VLA complete a grasp before the first high-level tool choice arrives.
-    exchange.guide['tool']='hold'
-    execution.phase='awaiting_initial_guidance'
+    # Start VLA immediately on the native task instruction. VLM supervises in
+    # parallel; geometric tools are recovery options after observed problems.
     jobs=queue.Queue(maxsize=1);tools=queue.Queue(maxsize=1);results=queue.Queue()
     report={'task':args.task,'split':args.split,'seed':args.seed,'instruction':instruction,
         'horizon':horizon,'control_hz':hz,'wall_limit_s':limit,'steps':0,'success':False,
         'wall_timeout':False,'checkpoint':'pi05_pretrain_human300','online_gt_state':False,
-        'mode':'duplex','env_step_s':0.,'hold_steps':0,'vla_steps':0,'tool_steps':0,
+        'mode':'duplex','initial_executor':'vla','tool_selection':'recovery_only',
+        'env_step_s':0.,'hold_steps':0,'vla_steps':0,'tool_steps':0,
         'tools_available':['vla','sam3','graspgen','grasp','place'],
         'motion_planner':'native_closed_loop_cartesian','recorder':'wall_clock_from_first_action'}
     start=time.monotonic();video=TimedVideo(run/'rollout_realtime.mp4',log) if args.video else None
