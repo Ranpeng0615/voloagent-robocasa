@@ -33,7 +33,7 @@ try:
             if state.exists():
                 try:s=json.loads(state.read_text())
                 except json.JSONDecodeError:s={}
-                if s and time.monotonic()>s['deadline_monotonic']+3:
+                if s.get('phase')=='running' and time.monotonic()>s['deadline_monotonic']+3:
                     os.killpg(task.pid,signal.SIGKILL);break
             elif time.monotonic()>watch:
                 os.killpg(task.pid,signal.SIGKILL);break
