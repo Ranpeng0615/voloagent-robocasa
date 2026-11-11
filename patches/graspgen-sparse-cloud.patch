@@ -1,0 +1,19 @@
+diff --git a/grasp_gen/grasp_server.py b/grasp_gen/grasp_server.py
+--- a/grasp_gen/grasp_server.py
++++ b/grasp_gen/grasp_server.py
+@@ -331,7 +331,14 @@ class GraspGenSampler:
+         """
+ 
+         if remove_outliers:
+-            obj_pcd, _ = point_cloud_outlier_removal(obj_pcd)
++            filtered, _ = point_cloud_outlier_removal(obj_pcd)
++            # At 256px, a small object can have only ~200 valid depth pixels.
++            # The fixed 20-neighbor / 14mm rule may remove the entire surface.
++            # Keep measured points instead of passing an empty cloud to PTv3.
++            if len(filtered) >= 64:
++                obj_pcd = filtered
++            else:
++                logger.warning("Sparse RGB-D cloud: retaining %d measured points after filter kept %d", len(obj_pcd), len(filtered))
+ 
+         obj_pcd_center = obj_pcd.mean(axis=0)
+         obj_pts_color = torch.zeros_like(obj_pcd)

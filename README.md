@@ -54,7 +54,7 @@ The launcher loads the model, verifies an inference call, starts DeepSeek and Vo
 
 The wall-clock limit is the native task horizon divided by the native control frequency, plus 20 seconds. It includes task-time VLA and VLM requests and simulation. Model loading/compilation and scene initialization happen before this timer. Video encoding happens afterward. Video shows simulation frames at the native frequency and omits reasoning waits.
 
-## Validated configuration
+## First serial validation
 
 - GPU: RTX PRO 6000 Blackwell Server Edition, about 96 GB.
 - Model: official RoboCasa365 `pi05_pretrain_human300`, revision in `configs/validated-versions.json`.
@@ -87,9 +87,13 @@ SAM3 needs licensed access to `facebook/sam3` for a fresh download. Existing loc
 
 The high-level VLM continuously reads the latest three-camera snapshot, short task memory, and executor feedback. It can continue, refine the VLA instruction, switch executors, hold, or stop. Only one VLM request is in flight, and old observations do not queue. The initial task decision happens with the robot holding still and counts toward the task budget.
 
+Executor selection is dynamic. VLA can keep control while it makes progress; the VLM can invoke grasp/place tools for a failed or unsuitable VLA action and return control to VLA when a tool is unsuitable. No task-specific tool schedule or forced tool quota is used. The previous external view is included for visual progress comparison.
+
 The simulation/control thread owns MuJoCo. VLA inference and tool preparation run in separate workers. Commands are applied at control boundaries without waiting for a model response. Each new instruction increments a revision, clears pending actions, and invalidates late results from the previous revision. Position holds preserve the last commanded gripper state. RGB, depth, camera calibration and robot proprioception are available; simulator object state and segmentation are not.
 
 Grasping reuses VoLoAgent's SAM3 server, `GraspClient`, depth projection, GraspGen sampling and collision filtering. The RoboCasa adapter converts the predicted Panda hand pose to the controlled grip site using the robot's rigid transform. It uses native base-frame OSC deltas for approach, closure and retreat. Placement localizes its support with SAM3 and depth. The Cartesian executor is not cuRobo, and it does not claim collision-free arm trajectories. Grasp motion completion is explicitly unverified until the VLM checks the visual result.
+
+The sparse-cloud patch preserves measured points when GraspGen's fixed outlier rule would leave fewer than 64. This handles small objects in 256px RGB-D observations without fabricating dense geometry or changing model weights. SAM3 also uses CUDA autocast and a local checkpoint path.
 
 This is asynchronous system execution. DeepSeek still receives one fixed observation set per request. π is the original checkpoint, without RTC training; its asynchronous action chunks use an executed-action prefix offset. Buffer exhaustion produces a visible position hold.
 

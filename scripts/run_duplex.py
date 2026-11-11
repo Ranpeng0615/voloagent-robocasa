@@ -89,6 +89,7 @@ class ExecutionState:
         self.tool_pending=False
         self.stale_results=0
         self.applied_commands=0
+        self.recent_events=collections.deque(maxlen=8)
 
     def apply(self, command, step):
         _,guide=self.exchange.read()
@@ -188,7 +189,8 @@ def main():
             'feedback':{'executor':guide['tool'],'phase':execution.phase,'queued_actions':len(execution.actions),
                 'last_gripper_close_command':execution.last_close,'gripper_qpos':obs['state.gripper_qpos'].tolist(),
                 'vla_pending':execution.vla_pending,'tool_pending':execution.tool_pending,
-                'robot_ee_world':ee[:3,3].tolist(), 'motion_success_is_unverified':True}}
+                'robot_ee_world':ee[:3,3].tolist(), 'motion_success_is_unverified':True,
+                'recent_executor_events':list(execution.recent_events)}}
 
     def wall_state(phase):
         value={'phase':phase,'steps':report['steps'],'limit_s':limit,'elapsed_s':time.monotonic()-start,
@@ -231,6 +233,8 @@ def main():
                     continue
                 if error:
                     execution.phase='failed_'+error[:150]
+                    execution.recent_events.append({'executor':result_guide['tool'],
+                        'args':result_guide['args'],'status':'failed','error':error,'step':report['steps']})
                     log.emit('executor_failed',kind=kind,error=error,step=report['steps'])
                     continue
                 if kind=='vla':
@@ -269,6 +273,12 @@ def main():
                 if motion_action is not None: action=motion_action;source='tool'
                 elif execution.motion.status!='moving':
                     if execution.phase!='motion_done_unverified': execution.held_offset=None
+                    if not getattr(execution.motion,'reported',False):
+                        execution.motion.reported=True
+                        event={'executor':guide['tool'],'args':guide['args'],
+                               'status':execution.phase,'step':report['steps']}
+                        execution.recent_events.append(event)
+                        log.emit('tool_motion_end',revision=guide['revision'],**event)
             execution.last_close=float(action[6])
             if video:
                 video.update(current['left'],{'step':report['steps'],'revision':guide['revision'],

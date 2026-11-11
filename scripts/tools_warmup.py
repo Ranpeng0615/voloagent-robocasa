@@ -30,4 +30,8 @@ tick=time.monotonic()
 pose,confidence=client.compute_grasp(points,np.ones((64,64),bool),(64,64),60.,enable_topdown_filter=False)
 report['graspgen_s']=time.monotonic()-tick
 report['grasp_finite']=bool(np.isfinite(pose).all())
+tick=time.monotonic()
+sparse_pose,_=client.compute_grasp(points[:201],np.ones((64,64),bool),(64,64),60.,enable_topdown_filter=False)
+report['sparse_grasp_finite']=bool(np.isfinite(sparse_pose).all())
+report['sparse_grasp_s']=time.monotonic()-tick
 print(json.dumps(report),flush=True)

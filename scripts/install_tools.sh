@@ -4,6 +4,7 @@ source "$(dirname "$0")/env.sh"
 cd "$ROBOCASA_ROOT"
 # Keep GPU tool dependencies separate from π's JAX and the CPU simulation env.
 [[ -x envs/tools/bin/python ]] || uv venv --system-site-packages --python /root/miniconda3/bin/python envs/tools
+export UV_CONSTRAINT="$REPRO_CODE_DIR/configs/tools-constraints.txt"
 uv pip install --python envs/tools/bin/python --index-url "$REPRO_PYPI_INDEX" \
   'numpy==1.26.4' omegaconf hydra-core scipy h5py trimesh meshcat scikit-learn \
   einops 'timm>=1.0.17' ftfy iopath regex pillow 'huggingface_hub<1' webdataset \

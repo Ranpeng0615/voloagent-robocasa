@@ -48,7 +48,7 @@ try:
             time.sleep(.1)
         task.wait()
     if (run/'result.json').exists():print((run/'result.json').read_text(),flush=True)
-    elif task.returncode:raise RuntimeError('Episode failed before writing result; inspect task.log')
+    if task.returncode:raise RuntimeError('Episode process failed; inspect result.json and task.log')
 finally:
     for name,p in reversed(services):
         if p.poll() is None:

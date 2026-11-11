@@ -26,8 +26,9 @@ Tools:
   by geometric tools.
 - grasp: author's SAM3 text segmentation + RGB-D point cloud + GraspGen
   prediction/collision filtering, then RoboCasa closed-loop approach, close,
-  lift. args={"target":"short visible object name"}. Prefer this for picking
-  visible loose objects. It reports motion_done_unverified after lifting;
+  lift. args={"target":"short visible object name"}. Suitable for a visible,
+  reachable loose object when geometric grasping is likely to help. It reports
+  motion_done_unverified after lifting;
   YOU verify visually that the object is held. It does not transport it.
 - place: SAM3 + depth localize a visible support; closed-loop transport,
   lower, open and retreat. args={"destination":"short visible support name"}.
@@ -47,6 +48,19 @@ verify and choose the next tool; do not continue a finished tool indefinitely.
 hold suspends motion. stop ends the episode only if the task is visibly complete
 or cannot continue; a simulator success check remains the evaluation authority.
 No simulator object coordinates, segmentation labels or success flags are given.
+
+SELECT EXECUTORS DYNAMICALLY. There is no fixed VLA/tool schedule, and picking
+does not automatically require a grasp tool. Choose whichever executor is most
+likely to advance the current stage. Keep VLA when it is making visible progress.
+If it closes on empty space, leaves an object behind while starting transport,
+stalls, or repeats a failed motion, actively consider grasp/place tools instead
+of repeatedly rewording the same instruction. Use SAM3/GraspGen only when the
+object is visible and the reachable geometric approach is appropriate. If a
+tool cannot detect the target, cannot converge, or cannot handle an articulated
+interaction, switch back to VLA with the specific unresolved goal. Do not force
+every available tool to be used. Explain each switch using observed evidence.
+Compare the previous external image, when supplied, with the current images;
+robot motion alone is not proof that the object or task made progress.
 '''
 
 
@@ -80,6 +94,7 @@ def parse_decision(text):
 def supervise(exchange, task, log):
     memory = ''
     previous_step = -1
+    previous_view = None
     with httpx.Client(timeout=httpx.Timeout(60, connect=5), trust_env=False) as client:
         while not exchange.stop.is_set():
             snapshot, guide = exchange.read()
@@ -93,6 +108,8 @@ def supervise(exchange, task, log):
             content = [{'type':'text','text':text}]
             for name, label in [('left','Left external'),('right','Right external'),('wrist','Wrist')]:
                 content.extend(image_part(snapshot[name], label))
+            if previous_view is not None:
+                content.extend(image_part(previous_view[1],f'Previous left external at step {previous_view[0]} (for progress comparison)'))
             tick = time.monotonic()
             log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'])
             try:
@@ -108,6 +125,7 @@ def supervise(exchange, task, log):
                 if exchange.stop.is_set():
                     break
                 memory = decision.get('memory',memory)
+                previous_view = (snapshot['step'],snapshot['left'])
                 exchange.command(decision,guide['revision'],snapshot['step'])
                 # Wait for the execution loop to apply this decision before
                 # selecting the next latest frame. Never queue old snapshots.
