@@ -64,10 +64,42 @@ The wall-clock limit is the native task horizon divided by the native control fr
 - Recovery: instruction replanning. Additional geometric grasp/place tools have not been validated in this deployment.
 - Online simulator ground-truth state is not sent to the monitor; native success is authoritative.
 - The VoLoAgent `libero` CLI profile selects the MuJoCo wire format; no LIBERO environment or assets are installed.
-- Calls remain serial: monitoring, policy inference, then simulation execution.
+- The original `run_episode.py` mode keeps serial calls. The optional duplex mode below runs independent workers.
 
 The inference patch loads normalization statistics directly from the checkpoint before building the data config. Serving therefore does not require the human demonstration datasets.
 
 First native episode passed: `PickPlaceCounterToStove`, seed 7, "Pick the broccoli from the plate and place it in the pan." Native success requires the object inside the pan and the gripper away from it. Result: **331 steps, 45.41 seconds, within the 50-second limit**. This is one episode, not an aggregate benchmark score.
 
 Dependency versions are captured in `configs/*-constraints.txt`. Third-party code and models retain their upstream licenses.
+
+## Duplex execution with SAM3 and GraspGen
+
+```bash
+source /root/autodl-tmp/robocasa-repro/code/scripts/env.sh
+python "$REPRO_CODE_DIR/scripts/checkout.py"
+python "$REPRO_CODE_DIR/scripts/apply_patches.py"
+bash "$REPRO_CODE_DIR/scripts/install_tools.sh"
+"$ROBOCASA_ROOT/envs/sim/bin/python" "$REPRO_CODE_DIR/scripts/download_tool_models.py"
+"$ROBOCASA_ROOT/envs/sim/bin/python" "$REPRO_CODE_DIR/scripts/run_episode.py" --duplex --task BreadAndCheese --seed 7 --video
+```
+
+SAM3 needs licensed access to `facebook/sam3` for a fresh download. Existing local weights are accepted and SHA-256 checked. Checkpoint revisions and paths are in `configs/tool-models.json`. Tool inference uses a separate GPU Torch environment; π keeps its JAX environment.
+
+The high-level VLM continuously reads the latest three-camera snapshot, short task memory, and executor feedback. It can continue, refine the VLA instruction, switch executors, hold, or stop. Only one VLM request is in flight, and old observations do not queue. The initial task decision happens with the robot holding still and counts toward the task budget.
+
+The simulation/control thread owns MuJoCo. VLA inference and tool preparation run in separate workers. Commands are applied at control boundaries without waiting for a model response. Each new instruction increments a revision, clears pending actions, and invalidates late results from the previous revision. Position holds preserve the last commanded gripper state. RGB, depth, camera calibration and robot proprioception are available; simulator object state and segmentation are not.
+
+Grasping reuses VoLoAgent's SAM3 server, `GraspClient`, depth projection, GraspGen sampling and collision filtering. The RoboCasa adapter converts the predicted Panda hand pose to the controlled grip site using the robot's rigid transform. It uses native base-frame OSC deltas for approach, closure and retreat. Placement localizes its support with SAM3 and depth. The Cartesian executor is not cuRobo, and it does not claim collision-free arm trajectories. Grasp motion completion is explicitly unverified until the VLM checks the visual result.
+
+This is asynchronous system execution. DeepSeek still receives one fixed observation set per request. π is the original checkpoint, without RTC training; its asynchronous action chunks use an executed-action prefix offset. Buffer exhaustion produces a visible position hold.
+
+`rollout_realtime.mp4` starts at the first non-hold control action and preserves wall time, including model/tool waits. A separate worker encodes timestamped frames, with no speed-up or removal of idle intervals. `result.json` includes first-action delay and both measured wall/video durations. The task limit remains native horizon/control rate plus 20 seconds, including initial task reasoning. `BreadAndCheese` has a 900-step horizon at 20 Hz (65-second wall limit) and requires both foods on the board and the gripper away.
+
+For diagnostics:
+
+```bash
+"$ROBOCASA_ROOT/envs/sim/bin/python" -m unittest discover -s "$REPRO_CODE_DIR/tests" -v
+"$ROBOCASA_ROOT/envs/sim/bin/python" "$REPRO_CODE_DIR/scripts/analyze_duplex.py" "$RUN_DIR"
+```
+
+`duplex_events.jsonl` records observations, decisions, applied commands, invalidated results, tool evidence and every control step. `analysis.json` measures how many control/motion steps happened during each VLM call. Task results must be read from the native success flag; a VLM stop message is not a successful benchmark result.

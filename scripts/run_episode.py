@@ -2,7 +2,9 @@
 import json,os,signal,socket,subprocess,sys,time
 from pathlib import Path
 root=Path(os.environ['ROBOCASA_ROOT']);code=Path(__file__).resolve().parents[1]
-run=root/'runs'/time.strftime('robocasa_%Y%m%d_%H%M%S');run.mkdir(parents=True)
+duplex='--duplex' in sys.argv
+task_args=[arg for arg in sys.argv[1:] if arg!='--duplex']
+run=root/'runs'/time.strftime(('duplex_' if duplex else 'robocasa_')+'%Y%m%d_%H%M%S');run.mkdir(parents=True)
 env={**os.environ,'RUN_DIR':str(run),'PYTHONPATH':str(code/'scripts')}
 services=[]
 def ready(port):
@@ -12,7 +14,7 @@ def launch(name,port,command,cwd=None):
     log=(run/f'{name}.log').open('wb')
     p=subprocess.Popen(command,env=env,cwd=cwd or code,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     services.append((name,p));(run/'services.json').write_text(json.dumps([{'name':n,'pid':v.pid} for n,v in services]))
-    deadline=time.monotonic()+240
+    deadline=time.monotonic()+600
     while not ready(port):
         if p.poll() is not None:raise RuntimeError(f'{name} exited; inspect {name}.log')
         if time.monotonic()>deadline:raise TimeoutError(f'{name} startup timeout')
@@ -23,10 +25,16 @@ try:
     launch('policy',8000,['bash',str(code/'scripts/start_policy.sh')])
     with (run/'policy_warmup.json').open('w') as f:
         subprocess.run([str(root/'envs/sim/bin/python'),str(code/'scripts/policy_warmup.py')],env=env,stdout=f,check=True,timeout=240)
-    launch('orchestrator',8001,['bash',str(code/'scripts/start_monitor.sh')])
+    if duplex:
+        launch('tools',8003,['bash',str(code/'scripts/start_tools.sh')])
+        with (run/'tools_warmup.json').open('w') as f:
+            subprocess.run([str(root/'envs/sim/bin/python'),str(code/'scripts/tools_warmup.py')],env=env,stdout=f,check=True,timeout=360)
+    else:
+        launch('orchestrator',8001,['bash',str(code/'scripts/start_monitor.sh')])
     print('RUN',run,flush=True)
     with (run/'task.log').open('wb') as f:
-        task=subprocess.Popen([str(root/'envs/sim/bin/python'),str(code/'scripts/run_one.py'),*sys.argv[1:]],env=env,stdout=f,stderr=subprocess.STDOUT,start_new_session=True)
+        entry='run_duplex.py' if duplex else 'run_one.py'
+        task=subprocess.Popen([str(root/'envs/sim/bin/python'),str(code/'scripts'/entry),*task_args],env=env,stdout=f,stderr=subprocess.STDOUT,start_new_session=True)
         services.append(('task',task));watch=time.monotonic()+600
         while task.poll() is None:
             state=run/'wall_state.json'

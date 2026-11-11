@@ -1,0 +1,18 @@
+{
+  "sam3": {
+    "repo": "facebook/sam3",
+    "revision": "3c879f39826c281e95690f02c7821c4de09afae7",
+    "files": {
+      "sam3.pt": {"destination": "sam3/sam3.pt", "sha256": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"}
+    }
+  },
+  "graspgen": {
+    "repo": "adithyamurali/GraspGenModels",
+    "revision": "ec1ccbb5eec0680db669246ac312a3636f16ee43",
+    "files": {
+      "checkpoints/graspgen_franka_panda.yml": {"destination": "GraspGenModels/checkpoints/graspgen_franka_panda.yml"},
+      "checkpoints/graspgen_franka_panda_gen.pth": {"destination": "GraspGenModels/checkpoints/graspgen_franka_panda_gen.pth", "sha256": "0597583b89b322d42ceb4e596967d6ed68d1b56cba4039895909ccd5bdc66eff"},
+      "checkpoints/graspgen_franka_panda_dis.pth": {"destination": "GraspGenModels/checkpoints/graspgen_franka_panda_dis.pth", "sha256": "e47d703c63b54c2d11fbc1effd43898f251b4147250888541e3b16e9c0d19e1c"}
+    }
+  }
+}

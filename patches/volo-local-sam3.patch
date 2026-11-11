@@ -1,0 +1,14 @@
+diff --git a/vlm_orchestrator/perception/sam3.py b/vlm_orchestrator/perception/sam3.py
+--- a/vlm_orchestrator/perception/sam3.py
++++ b/vlm_orchestrator/perception/sam3.py
+@@ -204,6 +204,10 @@ class SAM3Detector:
+             load_from_HF=True,
+             enable_segmentation=True,
+         )
++        local_checkpoint = os.environ.get("VOLO_SAM3_CHECKPOINT")
++        if local_checkpoint:
++            kwargs["load_from_HF"] = False
++            kwargs["checkpoint_path"] = local_checkpoint
+         if bpe_path is not None:
+             kwargs["bpe_path"] = bpe_path
+         self._model = build_sam3_image_model(**kwargs)
