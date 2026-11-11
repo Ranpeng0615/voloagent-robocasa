@@ -109,8 +109,8 @@ def make_plan(guide, snapshot, log, held_offset=None, client=None):
         pos,rot = ee[:3,3],ee[:3,:3]
         approach = world[:3,2]
         pre = pos-approach*PRE_GRASP_OFFSET
-        clear = p.copy();clear[2] = max(p[2],pre[2]+.06)
-        above = pre.copy();above[2] = clear[2]
+        above = pre.copy();above[2] = max(pre[2]+.06,center[2]+.18)
+        clear = p.copy();clear[2] = max(p[2],above[2])
         log.emit('graspgen_result',confidence=confidence,duration_s=time.monotonic()-tick,
                  revision=guide['revision'],grasp_world=world.tolist(),ee_target=ee.tolist())
         evidence.update(graspgen_confidence=confidence,grasp_world=world.tolist())
@@ -128,7 +128,7 @@ def make_plan(guide, snapshot, log, held_offset=None, client=None):
     release = center-object_offset
     release[2] = np.quantile(obj_world[:,2],.8)-object_offset[2]+.055
     clear = p.copy();clear[2] = max(p[2],release[2]+.12)
-    above = release.copy();above[2] = clear[2]
+    above = release.copy();above[2] = release[2]+.12
     return ToolPlan(name,[Waypoint('lift_for_transport',clear,r,1),
         Waypoint('transport',above,r,1),Waypoint('lower',release,r,1),
         Waypoint('release',release,r,0,dwell_s=.5),

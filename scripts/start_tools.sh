@@ -8,6 +8,6 @@ export TORCH_EXTENSIONS_DIR="$ROBOCASA_ROOT/cache/torch_extensions"
 export PYTORCH_KERNEL_CACHE_PATH="$ROBOCASA_ROOT/cache/torch/kernels"
 mkdir -p "$PYTORCH_KERNEL_CACHE_PATH"
 cd "$ROBOCASA_ROOT/repos/VoLoAgent"
-exec "$ROBOCASA_ROOT/envs/tools/bin/python" -m vlm_orchestrator.grasp.server \
+exec "$ROBOCASA_ROOT/envs/tools/bin/python" "$REPRO_CODE_DIR/scripts/tool_service.py" \
   --host 127.0.0.1 --port 8003 --enable-sam3 \
   --gripper-config "$ROBOCASA_ROOT/models/GraspGenModels/checkpoints/graspgen_franka_panda.yml"

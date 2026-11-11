@@ -4,12 +4,13 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from duplex_core import Exchange, EventLog, TimedVideo
 from duplex_vlm import parse_decision
 from run_duplex import ExecutionState
-from robocasa_tools import MotionExecutor, ToolPlan, Waypoint
+from robocasa_tools import MotionExecutor, ToolPlan, Waypoint, make_plan
 
 
 class DuplexControlTests(unittest.TestCase):
@@ -81,6 +82,23 @@ class DuplexControlTests(unittest.TestCase):
         action=motion.tick({'ee_pos':np.zeros(3),'ee_rot':np.eye(3)})
         self.assertIsNone(action)
         self.assertEqual(motion.status,'motion_done_unverified')
+
+    def test_high_initial_arm_does_not_force_unreachable_horizontal_approach(self):
+        pose=np.eye(4);pose[:3,:3]=np.diag([1,-1,-1]);pose[2,3]=.9
+        client=mock.Mock()
+        client.detect_and_segment.return_value=(np.ones((16,16),bool),.9,(0,0,16,16))
+        client.compute_grasp.return_value=(pose,.8)
+        mount=np.eye(4);mount[2,3]=.097
+        snap={'step':0,'left':np.zeros((16,16,3),np.uint8),'depth':np.full((16,16),.8),
+            'K':np.array([[16,0,8],[0,16,8],[0,0,1]]),'T_camera':np.eye(4),
+            'ee_pos':np.array([-.3,0,1.3]),'ee_rot':np.diag([1,-1,-1]),'T_hand_to_site':mount}
+        with mock.patch.dict('os.environ',{'RUN_DIR':self.temp.name}):
+            plan=make_plan({'tool':'grasp','revision':1,'args':{'target':'vegetable'}},snap,self.log,client=client)
+        above=next(w for w in plan.waypoints if w.phase=='above_target')
+        self.assertLess(above.pos[2],1.1)
+        self.assertGreater(above.pos[2],.8)
+        grasp=next(w for w in plan.waypoints if w.phase=='approach')
+        self.assertAlmostEqual(grasp.pos[2],.803)
 
     def test_video_keeps_wall_clock_pause(self):
         import cv2

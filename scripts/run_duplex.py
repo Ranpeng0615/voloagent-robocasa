@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
 import signal
 import threading
 import time
@@ -135,6 +136,7 @@ def main():
     parser.add_argument('--action-window',type=int,default=5)
     parser.add_argument('--video',action='store_true')
     args=parser.parse_args()
+    random.seed(args.seed);np.random.seed(args.seed)
     run=Path(os.environ['RUN_DIR']);run.mkdir(parents=True,exist_ok=True)
     env=gym.make(f'robocasa/{args.task}',split=args.split,seed=args.seed,camera_depths=True)
     obs,info=env.reset()
