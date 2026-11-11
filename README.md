@@ -91,13 +91,13 @@ Executor selection is dynamic. VLA can keep control while it makes progress; the
 
 The simulation/control thread owns MuJoCo. VLA inference and tool preparation run in separate workers. Commands are applied at control boundaries without waiting for a model response. Each new instruction increments a revision, clears pending actions, and invalidates late results from the previous revision. Position holds preserve the last commanded gripper state. RGB, depth, camera calibration and robot proprioception are available; simulator object state and segmentation are not.
 
-Grasping reuses VoLoAgent's SAM3 server, `GraspClient`, depth projection, GraspGen sampling and collision filtering. The RoboCasa adapter converts the predicted Panda hand pose to the controlled grip site using the robot's rigid transform. It uses native base-frame OSC deltas for approach, closure and retreat. Placement localizes its support with SAM3 and depth. The Cartesian executor is not cuRobo, and it does not claim collision-free arm trajectories. Grasp motion completion is explicitly unverified until the VLM checks the visual result.
+Grasping reuses VoLoAgent's SAM3 server, `GraspClient`, depth projection, GraspGen sampling and collision filtering. If an external view is occluded, it tries another calibrated external/wrist RGB-D pair. The RoboCasa adapter converts the predicted Panda hand pose to the controlled grip site using the robot's rigid transform. It uses native base-frame OSC deltas for approach, closure and retreat. Placement localizes its support with SAM3 and depth. The Cartesian executor is not cuRobo, and it does not claim collision-free arm trajectories. Grasp motion completion is explicitly unverified until the VLM checks the visual result. Geometric placement currently needs the held-object offset established by a preceding geometric grasp; VLA remains available for other placements.
 
 The sparse-cloud patch preserves measured points when GraspGen's fixed outlier rule would leave fewer than 64. This handles small objects in 256px RGB-D observations without fabricating dense geometry or changing model weights. SAM3 also uses CUDA autocast and a local checkpoint path.
 
 This is asynchronous system execution. DeepSeek still receives one fixed observation set per request. π is the original checkpoint, without RTC training; its asynchronous action chunks use an executed-action prefix offset. Buffer exhaustion produces a visible position hold.
 
-`rollout_realtime.mp4` starts at the first non-hold control action and preserves wall time, including model/tool waits. A separate worker encodes timestamped frames, with no speed-up or removal of idle intervals. `result.json` includes first-action delay and both measured wall/video durations. The task limit remains native horizon/control rate plus 20 seconds, including initial task reasoning. `BreadAndCheese` has a 900-step horizon at 20 Hz (65-second wall limit) and requires both foods on the board and the gripper away.
+`rollout_realtime.mp4` starts at the first non-hold control action and preserves wall time, including model/tool waits. A separate worker encodes timestamped frames, with no speed-up or removal of idle intervals. `result.json` includes first-action delay and both measured wall/video durations. Execution stops on native success, native step horizon, wall deadline, or a VLM stop, whichever comes first. The wall deadline remains native horizon/control rate plus 20 seconds, including initial task reasoning. `BreadAndCheese` has a 900-step horizon at 20 Hz (65-second wall limit) and requires both foods on the board and the gripper away.
 
 For diagnostics:
 
@@ -107,3 +107,13 @@ For diagnostics:
 ```
 
 `duplex_events.jsonl` records observations, decisions, applied commands, invalidated results, tool evidence and every control step. `analysis.json` measures how many control/motion steps happened during each VLM call. Task results must be read from the native success flag; a VLM stop message is not a successful benchmark result.
+
+## Duplex validation result
+
+Eleven control/regression checks pass, including action invalidation, command acknowledgement, gripper preservation, camera/controller frames and wall-time recording. The latest `SteamInMicrowave` run used code `74e81cc`, native/Python/NumPy seed 7, and tool model seed 7. It attempted broccoli from sink to bowl, bowl to microwave, close door, and start.
+
+Native result: **failed**, 2100 steps, 119.56 seconds within a 125-second wall limit. The video lasts 116.60 seconds versus 116.58 measured seconds from the first action. There were 17 completed VLM calls (mean 6.63 seconds) and 400 VLA calls (mean 74 milliseconds). During one 15.66-second VLM call, 270 non-hold control steps continued. The maximum measured delivery delay after a VLM command arrived was 43.7 milliseconds; this excludes the VLM's own reasoning time.
+
+SAM3 and GraspGen inference, tool preparation and native motion execution ran on the deployed stack. The geometric grasp failed to converge above the recessed sink, with about 5 cm horizontal error, and the VLM returned control to VLA. VLA also did not complete the grasp within the native horizon. The VLM repeatedly allowed continued approach despite little object progress. Thus the asynchronous routing is demonstrated; reliable grasp recovery and completion of this long task are not yet demonstrated. Earlier trials also show VLA-to-tool switching and rejection of an obsolete in-flight VLA result. Earlier trials did not set the global Python/NumPy seeds and are not controlled A/B comparisons.
+
+Run videos, model/tool inputs, decisions and manifests remain under the server runtime root. They are not committed to the public repository.

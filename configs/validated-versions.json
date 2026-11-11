@@ -20,5 +20,23 @@
   "first_task_success": true,
   "first_task_wall_s": 45.41305768303573,
   "first_task_steps": 331,
-  "wall_limit_s": 50.0
+  "wall_limit_s": 50.0,
+  "duplex_validation": {
+    "code_at_latest_trial": "74e81cc",
+    "control_regression_checks_passed": 11,
+    "tool_gpu_torch": "2.15.0+cu132",
+    "tool_models_inference_verified": ["sam3", "graspgen"],
+    "motion_adapter": "native_closed_loop_cartesian",
+    "curobo_deployed": false,
+    "latest_task": "SteamInMicrowave",
+    "native_success": false,
+    "steps": 2100,
+    "task_wall_s": 119.56195202097297,
+    "wall_limit_s": 125.0,
+    "video_s": 116.6,
+    "wall_from_first_action_s": 116.58116099995095,
+    "vlm_mean_s": 6.63030595315949,
+    "vla_mean_s": 0.07435079586692155,
+    "max_command_delivery_s": 0.043691316968761384
+  }
 }
