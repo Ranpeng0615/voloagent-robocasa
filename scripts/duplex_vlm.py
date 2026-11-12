@@ -1,5 +1,6 @@
 """Continuous high-level visual supervision using the configured DeepSeek bridge."""
 import base64
+import collections
 import io
 import json
 import time
@@ -13,6 +14,16 @@ images, task memory and actual tool results to decide what to do next. Keep VLA
 when it works; use other tools when they can resolve a problem. You choose the
 subgoals, tool order, motion targets, gripper actions and recovery. No fixed grasp
 or placement sequence is inserted by the executor.
+
+Judge progress toward the current goal, not just whether the object is still
+held or the arm moves. For transport, compare the object and destination in the
+external views over time. If it remains by the sink instead of approaching the
+bowl, recognize stalled transport even when the grasp is intact. The historical
+external views show a longer interval than the previous frame; use both.
+Keeping the same instruction wording does not require keeping VLA as executor.
+When VLA is ineffective, actively compare tool recovery with another VLA retry.
+Use tools when they can resolve the observed problem instead of indefinitely
+describing repeated motion as progress. You decide when and which tool to use.
 
 Return JSON:
 {"command":"continue|refine|switch_tool|call_tool|hold|stop",
@@ -33,6 +44,13 @@ For continue, omit instruction or return instruction=""; the active instruction
 is retained. Use refine when you intentionally change the goal or corrective
 action, rather than paraphrasing the same goal on every observation. You still
 choose when to change goals, recover, hold or use tools.
+
+Match recovery to the unresolved action. If grasping is the problem, GraspGen can
+predict a grasp. If an object is already held but transport stalls, SAM3 can
+localize the destination; move_ee can move the held object while preserving the
+gripper, and gripper can release when you choose. Re-grasping is not required
+for transport recovery. These are available capabilities, not a fixed recipe.
+Explain a recovery choice in reason using observed progress and tool feedback.
 
 Tools and arguments:
 - vla: language-guided robot policy using all three cameras. refine updates its
@@ -89,12 +107,22 @@ def image_part(array, label):
         'url': 'data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode()}}]
 
 
-def parse_decision(text):
+def parse_decision(text, active_tool=None):
     text = text.strip()
     if text.startswith('```'):
         text = text.split('\n',1)[1].rsplit('```',1)[0]
     value = json.loads(text)
+    if isinstance(value,dict) and value.get('tool') is None:
+        # Recover unambiguous omitted fields, without choosing a new executor.
+        default={'continue':active_tool,'refine':'vla','hold':'hold','stop':active_tool}.get(value.get('command'))
+        if default is not None:value.update(tool=default,tool_defaulted=True)
     return validate_decision(value)
+
+
+def progress_reference(history, wall_s):
+    """Choose an older visual baseline, not a timeout or failure detector."""
+    candidates=[row for row in history if wall_s-row['wall_s']>=8]
+    return min(candidates,key=lambda row:abs(wall_s-row['wall_s']-10)) if candidates else None
 
 
 def supervise(exchange, task, log):
@@ -102,6 +130,7 @@ def supervise(exchange, task, log):
     initial_plan = None
     previous_step = -1
     previous_view = None
+    history=collections.deque(maxlen=64)
     with httpx.Client(timeout=httpx.Timeout(60, connect=5), trust_env=False) as client:
         while not exchange.stop.is_set():
             snapshot, guide = exchange.read()
@@ -111,16 +140,27 @@ def supervise(exchange, task, log):
             previous_step = snapshot['step']
             planning=initial_plan is None
             request_kind='initial_plan' if planning else 'monitor'
+            while history and snapshot['wall_s']-history[0]['wall_s']>25:history.popleft()
+            reference=progress_reference(history,snapshot['wall_s'])
+            reference_info=None if reference is None else {k:reference[k] for k in ['step','wall_s','instruction']}
             text = json.dumps({'task':task, 'observed_step':snapshot['step'],
                 'observed_wall_s':snapshot['wall_s'],
                 'frame_age_at_pack_s':time.monotonic()-snapshot['captured_at_monotonic'],
                 'request_kind':request_kind, 'initial_plan':initial_plan,
+                'progress_reference':reference_info,
                 'active':guide, 'feedback':snapshot['feedback'], 'memory':memory},ensure_ascii=False)
             content = [{'type':'text','text':text}]
             for name, label in [('left','Left external'),('right','Right external'),('wrist','Wrist')]:
                 content.extend(image_part(snapshot[name], label))
             if previous_view is not None:
                 content.extend(image_part(previous_view[1],f'Previous left external at step {previous_view[0]} (for progress comparison)'))
+            if reference is not None:
+                for name in ['left','right']:
+                    content.extend(image_part(reference[name],
+                        f'Historical {name} external at step {reference["step"]}, wall {reference["wall_s"]:.2f}s; '
+                        f'{snapshot["wall_s"]-reference["wall_s"]:.2f}s before current images'))
+            history.append({'step':snapshot['step'],'wall_s':snapshot['wall_s'],
+                'instruction':guide['instruction'],'left':snapshot['left'].copy(),'right':snapshot['right'].copy()})
             tick = time.monotonic()
             log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'],
                 request_kind=request_kind,thinking='max' if planning else 'disabled',
@@ -136,7 +176,7 @@ def supervise(exchange, task, log):
                 response = client.post('http://127.0.0.1:8111/v1/chat/completions',json=payload)
                 response.raise_for_status()
                 raw = response.json()['choices'][0]['message']['content']
-                decision = parse_decision(raw)
+                decision = parse_decision(raw,guide['tool'])
                 if planning:
                     plan=decision.get('plan')
                     initial_plan=plan if isinstance(plan,list) and plan and all(isinstance(s,str) and s.strip() for s in plan) else [task]

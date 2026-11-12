@@ -91,6 +91,8 @@ The VLM chooses subgoals and tool order. There is no built-in grasp/place sequen
 
 VLA instructions are short imperative action goals, passed verbatim to the policy. Scene descriptions, explanations, grasp assessments and future plans belong in `reason/memory`. For `continue`, the VLM omits `instruction` or returns an empty string to retain the active goal without flushing queued actions. It selects `refine` for an intentional goal/correction change, rather than paraphrasing the same goal each observation. Explicitly changed instructions are still applied; the executor does not silently discard them.
 
+The monitor also receives a timestamped pair of historical external views, selected near ten seconds before the current observation when available. This visual baseline remains across instruction refinements. It helps the VLM distinguish holding an object from approaching a destination. Frame age is context only: no timer marks failure or forces a tool switch. The prompt asks the VLM to compare available tools when progress stalls, including destination localization and pose movement for an already held object. Omitted `tool` fields on `continue/refine/hold/stop` are resolved only where the command already determines the executor; a new tool call/switch still needs an explicit tool.
+
 | Tool | Input and behavior |
 | --- | --- |
 | `vla` | A language instruction; continues asynchronously until changed or cancelled. |

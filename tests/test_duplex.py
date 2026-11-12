@@ -12,7 +12,7 @@ from unittest import mock
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from duplex_core import Exchange, EventLog, TimedVideo
-from duplex_vlm import parse_decision, supervise
+from duplex_vlm import parse_decision, supervise, progress_reference
 from duplex_contract import executor_feedback
 from run_duplex import ExecutionState, policy_wire, tool_worker
 from robocasa_tools import MotionExecutor, ToolPlan, Waypoint, make_plan, perceive
@@ -402,6 +402,25 @@ class DuplexControlTests(unittest.TestCase):
         duration=cap.get(cv2.CAP_PROP_FRAME_COUNT)/cap.get(cv2.CAP_PROP_FPS);cap.release()
         self.assertLess(abs(duration-report['wall_from_first_action_s']),.08)
         self.assertIsNone(report['error'])
+
+    def test_missing_tool_preserves_unambiguous_command_meaning(self):
+        value=parse_decision('{"command":"continue","instruction":""}','move_ee')
+        self.assertEqual(value['tool'],'move_ee')
+        self.assertTrue(value['tool_defaulted'])
+        value=parse_decision('{"command":"refine","instruction":"Place the broccoli in the bowl."}','hold')
+        self.assertEqual(value['tool'],'vla')
+        for command in ['call_tool','switch_tool']:
+            with self.assertRaises(ValueError):
+                parse_decision(json.dumps({'command':command,'args':{'target':'bowl'}}),'vla')
+
+    def test_historical_visual_baseline_is_retained_across_goal_changes(self):
+        history=[{'step':0,'wall_s':0,'instruction':'pick bread'},
+            {'step':200,'wall_s':10,'instruction':'pick bread'},
+            {'step':360,'wall_s':18,'instruction':'place bread'}]
+        reference=progress_reference(history,21)
+        self.assertEqual(reference['step'],200)
+        self.assertEqual(reference['instruction'],'pick bread')
+        self.assertIsNone(progress_reference(history[:1],5))
 
     def test_invalid_tool_decision_is_rejected(self):
         with self.assertRaises(ValueError):
