@@ -17,11 +17,22 @@ or placement sequence is inserted by the executor.
 Return JSON:
 {"command":"continue|refine|switch_tool|call_tool|hold|stop",
  "tool":"vla|sam3|graspgen|move_ee|gripper|hold",
- "instruction":"guidance", "args":{}, "reason":"visible evidence",
+ "instruction":"short action goal, or empty when continuing", "args":{}, "reason":"visible evidence",
  "memory":"compact task progress", "plan":["initial task plan"]}.
 On initial_plan, establish a plan. Later calls include that plan and memory;
 update progress and any plan adjustments in memory. Each request contains fixed
 images, not live input; the robot can move while a response is generated.
+
+VLA instruction is passed verbatim to the robot policy. Write a short imperative
+for the current action goal, such as "Place the bowl in the microwave."
+Put scene descriptions, grasp assessments, explanations and future plans in
+reason/memory, not in instruction. Choose the goal from the actual current
+images; if an object is already held, describe the remaining action rather than
+repeating acquisition. Keep the same instruction while pursuing the same goal.
+For continue, omit instruction or return instruction=""; the active instruction
+is retained. Use refine when you intentionally change the goal or corrective
+action, rather than paraphrasing the same goal on every observation. You still
+choose when to change goals, recover, hold or use tools.
 
 Tools and arguments:
 - vla: language-guided robot policy using all three cameras. refine updates its
@@ -56,7 +67,8 @@ prediction and its pose_ref, even after another query. Neither query results nor
 failure reports automatically change the executor. Decide whether to hold for
 perception or continue moving, and whether a predicted pose still fits the images.
 
-continue keeps the active motion. Changed VLA instructions apply as refine;
+continue keeps the active motion and instruction when instruction is empty.
+An explicitly changed VLA instruction still applies as refine;
 changed motion tool/args apply as switch_tool. A switch or refine cancels old
 motion and queued actions; late motion results cannot restart it. To retry a
 finished motion, use switch_tool. Commands and required arguments are validated;

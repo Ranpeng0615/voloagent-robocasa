@@ -89,6 +89,8 @@ VLA starts immediately with the native task instruction. The VLM receives the la
 
 The VLM chooses subgoals and tool order. There is no built-in grasp/place sequence, verification-lift requirement, holding gate, forced recovery switch or finger-spacing classification. The native success check determines task success. This is a custom RoboCasa adapter using the author's perception tools, not the author's unmodified motion executor.
 
+VLA instructions are short imperative action goals, passed verbatim to the policy. Scene descriptions, explanations, grasp assessments and future plans belong in `reason/memory`. For `continue`, the VLM omits `instruction` or returns an empty string to retain the active goal without flushing queued actions. It selects `refine` for an intentional goal/correction change, rather than paraphrasing the same goal each observation. Explicitly changed instructions are still applied; the executor does not silently discard them.
+
 | Tool | Input and behavior |
 | --- | --- |
 | `vla` | A language instruction; continues asynchronously until changed or cancelled. |

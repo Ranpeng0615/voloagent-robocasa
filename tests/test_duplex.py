@@ -81,10 +81,13 @@ class DuplexControlTests(unittest.TestCase):
 
     def test_unchanged_continue_keeps_buffer_and_inflight_work(self):
         self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
-        self.owner.apply(self.command('continue',instruction=' pick   bread '),42)
-        self.assertEqual(self.bus.guide['revision'],0)
-        self.assertEqual(len(self.owner.actions),1)
-        self.assertTrue(self.owner.vla_pending)
+        for instruction in [' pick   bread ','']:
+            self.owner.apply(self.command('continue',instruction=instruction,
+                reason='Bread is now held; task is progressing.',memory='Continue the current goal.'),42)
+            self.assertEqual(self.bus.guide['instruction'],'pick bread')
+            self.assertEqual(self.bus.guide['revision'],0)
+            self.assertEqual(len(self.owner.actions),1)
+            self.assertTrue(self.owner.vla_pending)
 
     def test_continue_tool_change_is_applied_as_switch(self):
         guide=self.owner.apply(self.command('continue',tool='move_ee',args={'pose_ref':'current','offset_world':[0,0,.05]}),42)
