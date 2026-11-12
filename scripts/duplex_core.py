@@ -39,10 +39,11 @@ class Exchange:
         with self.condition:
             return self.snapshot, dict(self.guide)
 
-    def command(self, decision, based_revision, observed_step):
+    def command(self, decision, based_revision, observed_step, based_feedback_version=None):
         with self.condition:
             self.command_seq += 1
             self.commands.append({**decision, 'based_revision': based_revision,
+                                  'based_feedback_version': based_feedback_version,
                                   'observed_step': observed_step, 'received_at': time.monotonic(),
                                   'command_id': self.command_seq})
             self.condition.notify_all()

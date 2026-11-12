@@ -33,6 +33,12 @@ Return JSON:
 On initial_plan, establish a plan. Later calls include that plan and memory;
 update progress and any plan adjustments in memory. Each request contains fixed
 images, not live input; the robot can move while a response is generated.
+feedback.feedback_version changes on discrete tool submissions, completions and
+executor outcomes. A response based on superseded feedback is discarded and a
+fresh observation is requested; its memory update is not committed. Results
+already marked completed/failed are available now, not pending. hold persists
+until you explicitly select another executor; perception queries never resume
+motion themselves. Base any continued hold on the current feedback and images.
 
 VLA instruction is passed verbatim to the robot policy. Write a short imperative
 for the current action goal, such as "Place the bowl in the microwave."
@@ -131,17 +137,20 @@ def progress_reference(history, wall_s):
 def supervise(exchange, task, log):
     memory = ''
     initial_plan = None
-    previous_step = -1
+    previous_observation = None
     previous_view = None
     history=collections.deque(maxlen=64)
     last_response_error=None
     with httpx.Client(timeout=httpx.Timeout(190, connect=5), trust_env=False) as client:
         while not exchange.stop.is_set():
             snapshot, guide = exchange.read()
-            if snapshot is None or snapshot['step'] == previous_step:
+            observation = None if snapshot is None else (snapshot['step'],
+                snapshot['feedback'].get('feedback_version',0), guide['revision'])
+            if snapshot is None or observation == previous_observation:
                 exchange.stop.wait(.03)
                 continue
-            previous_step = snapshot['step']
+            previous_observation = observation
+            feedback_version=snapshot['feedback'].get('feedback_version',0)
             planning=initial_plan is None
             request_kind='initial_plan' if planning else 'monitor'
             while history and snapshot['wall_s']-history[0]['wall_s']>25:history.popleft()
@@ -182,25 +191,40 @@ def supervise(exchange, task, log):
                 raw = response.json()['choices'][0]['message']['content']
                 decision = parse_decision(raw,guide['tool'])
                 last_response_error=None
-                if planning:
-                    plan=decision.get('plan')
-                    initial_plan=plan if isinstance(plan,list) and plan and all(isinstance(s,str) and s.strip() for s in plan) else [task]
                 current, _ = exchange.read()
+                current_feedback=current['feedback'].get('feedback_version',0)
                 log.emit('vlm_end', observed_step=snapshot['step'], current_step=current['step'],
                     revision=guide['revision'], duration_s=time.monotonic()-tick, decision=decision,
                     request_kind=request_kind,thinking='high',model='gpt-6.1-sol',service_tier='fast',
                     input_frame_age_s=time.monotonic()-snapshot['captured_at_monotonic'],
                     latest_frame_age_s=time.monotonic()-current['captured_at_monotonic'],
-                    current_phase=current['feedback']['phase'])
+                    current_phase=current['feedback']['phase'],
+                    based_feedback_version=feedback_version,feedback_version=current_feedback)
                 if exchange.stop.is_set():
                     break
-                memory = decision.get('memory',memory)
-                previous_view = (snapshot['step'],snapshot['left'])
-                command_id=exchange.command(decision,guide['revision'],snapshot['step'])
+                if current_feedback!=feedback_version:
+                    last_response_error='Previous response discarded: tool/executor feedback changed during reasoning. Reassess the latest observation and returned results.'
+                    log.emit('vlm_response_discarded',reason='obsolete_feedback',
+                        observed_step=snapshot['step'],based_feedback_version=feedback_version,
+                        feedback_version=current_feedback,decision=decision)
+                    continue
+                command_id=exchange.command(decision,guide['revision'],snapshot['step'],
+                    based_feedback_version=feedback_version)
                 # Wait for the execution loop to apply this decision before
                 # selecting the next latest frame. Never queue old snapshots.
                 with exchange.condition:
                     exchange.condition.wait_for(lambda: exchange.acknowledged>=command_id or exchange.stop.is_set())
+                if exchange.stop.is_set():break
+                applied,_=exchange.read()
+                outcome=applied['feedback'].get('last_guidance_result') or {}
+                if outcome.get('status')=='rejected':
+                    last_response_error='Previous command rejected: '+str(outcome.get('reason'))
+                    continue
+                memory = decision.get('memory',memory)
+                previous_view = (snapshot['step'],snapshot['left'])
+                if planning:
+                    plan=decision.get('plan')
+                    initial_plan=plan if isinstance(plan,list) and plan and all(isinstance(s,str) and s.strip() for s in plan) else [task]
             except Exception as exc:
                 last_response_error=f'{type(exc).__name__}: {exc}'
                 log.emit('vlm_error', error=f'{type(exc).__name__}: {exc}',duration_s=time.monotonic()-tick)

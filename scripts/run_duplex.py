@@ -98,12 +98,21 @@ class ExecutionState:
         self.recent_events=collections.deque(maxlen=8)
         self.last_guidance_result=None
         self.last_visual_assessment=None
+        self.feedback_version=0
 
     def apply(self, command, step):
         _,guide=self.exchange.read()
         if command['based_revision']!=guide['revision']:
             self.last_guidance_result={'status':'rejected','reason':'obsolete_revision'}
             self.log.emit('command_discarded',reason='obsolete_revision',step=step,command=command)
+            return None
+        based_feedback=command.get('based_feedback_version')
+        if based_feedback is not None and based_feedback!=self.feedback_version:
+            self.last_guidance_result={'status':'rejected','reason':'obsolete_feedback',
+                'observed_step':command.get('observed_step'),
+                'based_feedback_version':based_feedback,'feedback_version':self.feedback_version}
+            self.log.emit('command_discarded',reason='obsolete_feedback',step=step,command=command,
+                feedback_version=self.feedback_version)
             return None
         try:
             resolved=resolve_decision(command,guide,self.phase)
@@ -122,6 +131,7 @@ class ExecutionState:
         if kind=='call_tool':
             self.query_count+=1
             self.tool_pending=True
+            self.feedback_version+=1
             self.applied_commands+=1
             request={**resolved,'revision':guide['revision'],'request_id':self.query_count,'query':True}
             self.last_guidance_result.update(status='submitted',request_id=self.query_count)
@@ -150,6 +160,7 @@ class ExecutionState:
     def query_result(self, request, source, value, error, step):
         """Read-only results retain observation age; they never change motion."""
         self.tool_pending=False
+        self.feedback_version+=1
         self.latest_tool_result={'request_id':request['request_id'],'tool':request['tool'],
             'args':request['args'],'observed_step':source['step'],
             'observed_wall_s':source.get('wall_s'),
@@ -263,20 +274,6 @@ def main():
     log.emit('episode_begin',task=args.task,horizon=horizon,wall_limit_s=limit)
     try:
         while report['steps']<horizon and time.monotonic()-start<limit:
-            commands=exchange.take_commands()
-            for command in commands:
-                applied=execution.apply(command,report['steps'])
-                if applied=='stop':
-                    report['stopped_by_vlm']=True
-                    break
-                if isinstance(applied,dict) and applied.get('query'):
-                    tools.put_nowait((applied,current,execution.grasp_pose))
-                elif isinstance(applied,dict) and applied['tool'] in MOTION_TOOLS:
-                    if execution.tool_pending:
-                        # A cancelled GPU request may finish, but its result is
-                        # version-checked. The new request starts once it clears.
-                        execution.phase='waiting_for_cancelled_inference'
-            if report.get('stopped_by_vlm'): break
             _,guide=exchange.read()
             while True:
                 try: kind,result_guide,source,value,error=results.get_nowait()
@@ -289,6 +286,8 @@ def main():
                 if not execution.accepts(result_guide['revision'],kind,report['steps']):
                     continue
                 if error:
+                    if not execution.phase.startswith('failed'):
+                        execution.feedback_version+=1
                     execution.phase='failed_'+error[:150]
                     execution.recent_events.append({'executor':result_guide['tool'],
                         'args':result_guide['args'],'status':'failed','error':error,'step':report['steps']})
@@ -305,6 +304,8 @@ def main():
                         continue
                     execution.actions.clear()
                     execution.actions.extend(value[age:age+args.action_window])
+                    if execution.phase.startswith('failed'):
+                        execution.feedback_version+=1
                     execution.phase='executing'
                     with (run/'policy_chunks.jsonl').open('a') as f:
                         f.write(json.dumps({'step':report['steps'],'observed_step':source['step'],
@@ -314,6 +315,21 @@ def main():
                     execution.motion=MotionExecutor(value)
                     execution.phase=execution.motion.phase
                     log.emit('tool_motion_begin',tool=value.name,revision=guide['revision'],step=report['steps'],evidence=value.evidence)
+            commands=exchange.take_commands()
+            for command in commands:
+                applied=execution.apply(command,report['steps'])
+                if applied=='stop':
+                    report['stopped_by_vlm']=True
+                    break
+                if isinstance(applied,dict) and applied.get('query'):
+                    tools.put_nowait((applied,current,execution.grasp_pose))
+                elif isinstance(applied,dict) and applied['tool'] in MOTION_TOOLS:
+                    if execution.tool_pending:
+                        # A cancelled GPU request may finish, but its result is
+                        # version-checked. The new request starts once it clears.
+                        execution.phase='waiting_for_cancelled_inference'
+            if report.get('stopped_by_vlm'): break
+            _,guide=exchange.read()
             # Refresh robot/feedback state after command and result application.
             current=snapshot();exchange.publish(current)
             for command in commands:exchange.acknowledge(command.get('command_id',0))
@@ -331,6 +347,7 @@ def main():
                 elif execution.motion.status!='moving':
                     if not getattr(execution.motion,'reported',False):
                         execution.motion.reported=True
+                        execution.feedback_version+=1
                         event={'executor':guide['tool'],'args':guide['args'],
                                'status':execution.phase,'step':report['steps']}
                         execution.recent_events.append(event)

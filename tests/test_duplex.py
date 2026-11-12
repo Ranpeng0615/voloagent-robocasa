@@ -55,6 +55,76 @@ class DuplexControlTests(unittest.TestCase):
         self.owner.apply(self.command('hold',tool='hold'),23)
         self.assertEqual(self.owner.hold()[6],1.)
 
+    def test_tool_completion_invalidates_queued_guidance_without_cancelling_vla(self):
+        # Completion can race with delivery, after the supervisor's own check.
+        for error in [None,'No usable segmentation']:
+            for kind,tool,args in [('hold','hold',{}),('refine','vla',{}),
+                ('switch_tool','gripper',{'command':'open'}),('stop','vla',{})]:
+                with self.subTest(error=error,command=kind):
+                    bus=Exchange('pick bread');owner=ExecutionState(bus,self.log)
+                    owner.last_close=1.;owner.actions.append(np.ones(12))
+                    request=owner.apply(self.command('call_tool',tool='sam3',args={'target':'bread'}),10)
+                    pending_version=owner.feedback_version
+                    old=self.command(kind,tool=tool,args=args,based_feedback_version=pending_version)
+                    owner.query_result(request,{'step':10}, {'position_world':[0,0,1]},error,11)
+                    self.assertIsNone(owner.apply(old,12))
+                    self.assertEqual(owner.last_guidance_result['reason'],'obsolete_feedback')
+                    self.assertEqual(bus.guide['tool'],'vla')
+                    self.assertEqual(bus.guide['revision'],0)
+                    self.assertEqual(len(owner.actions),1)
+                    self.assertEqual(owner.last_close,1.)
+
+    def test_fresh_explicit_hold_and_resume_remain_vlm_controlled(self):
+        request=self.owner.apply(self.command('call_tool',tool='sam3',args={'target':'bread'}),10)
+        guide=self.owner.apply(self.command('hold',tool='hold',
+            based_feedback_version=self.owner.feedback_version),11)
+        self.assertEqual(guide['tool'],'hold')
+        self.owner.query_result(request,{'step':10},{'position_world':[0,0,1]},None,12)
+        # A valid explicit pause is not undone by an automatic tool/VLA route.
+        self.assertEqual(self.bus.guide['tool'],'hold')
+        guide=self.owner.apply(self.command('switch_tool',tool='vla',revision=1,
+            based_feedback_version=self.owner.feedback_version),13)
+        self.assertEqual(guide['tool'],'vla')
+        self.assertEqual(self.owner.phase,'awaiting_policy')
+
+    def test_tool_result_during_reasoning_discards_old_hold_and_its_memory(self):
+        request=self.owner.apply(self.command('call_tool',tool='sam3',args={'target':'bread'}),10)
+        requests=[]
+        def frame(step):
+            return {'step':step,'wall_s':step/20,'captured_at_monotonic':time.monotonic(),
+                'feedback':executor_feedback(self.bus.guide,self.owner,[0,0],[0,0,0],20),
+                **{k:np.zeros((16,16,3),np.uint8) for k in ['left','right','wrist']}}
+        self.owner.actions.append(np.ones(12));self.owner.last_close=1.
+        self.bus.publish(frame(10))
+        def post(url,**kwargs):
+            requests.append(kwargs['json'])
+            if len(requests)==1:
+                self.owner.query_result(request,{'step':10},{'position_world':[0,0,1]},None,11)
+                # Feedback may update without waiting for another camera step.
+                self.bus.publish(frame(10))
+                decision={'command':'hold','tool':'hold','reason':'Query is pending',
+                    'memory':'still waiting for query','plan':['wait for query']}
+            else:
+                self.bus.stop.set()
+                decision={'command':'continue','tool':'vla'}
+            response=mock.Mock()
+            response.json.return_value={'choices':[{'message':{'content':json.dumps(decision)}}]}
+            return response
+        with mock.patch('duplex_vlm.httpx.Client') as client:
+            client.return_value.__enter__.return_value.post.side_effect=post
+            supervise(self.bus,'pick bread',self.log)
+        self.assertEqual(len(requests),2)
+        fresh=json.loads(requests[1]['messages'][1]['content'][0]['text'])
+        self.assertEqual(fresh['feedback']['latest_tool_result']['status'],'completed')
+        self.assertFalse(fresh['feedback']['tool_pending'])
+        self.assertIn('discarded',fresh['last_response_error'])
+        self.assertEqual(fresh['memory'],'')
+        self.assertIsNone(fresh['initial_plan'])
+        self.assertFalse(self.bus.take_commands())
+        self.assertEqual(self.bus.guide['tool'],'vla')
+        self.assertEqual(len(self.owner.actions),1)
+        self.assertEqual(self.owner.last_close,1.)
+
     def test_inflight_old_vla_and_tool_results_are_rejected_after_refine(self):
         self.owner.apply(self.command('refine'),24)
         self.assertFalse(self.owner.accepts(0,'vla',25))

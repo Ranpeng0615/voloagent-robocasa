@@ -103,6 +103,7 @@ def gripper_command(raw_value):
 def executor_feedback(guide, execution, qpos, ee_world, control_hz):
     return {
         'schema_version': 2,
+        'feedback_version': execution.feedback_version,
         'executor': guide['tool'], 'phase': execution.phase,
         'gripper': {'commanded': gripper_command(execution.last_close),
             'finger_separation_m': abs(float(qpos[0])-float(qpos[1]))},
