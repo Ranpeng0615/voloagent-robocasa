@@ -21,7 +21,11 @@ def launch(name,port,command,cwd=None):
         time.sleep(.5)
     print(name,'READY',flush=True)
 try:
-    launch('deepseek',8111,[str(root/'envs/sim/bin/python'),'-m','uvicorn','deepseek_bridge:app','--host','127.0.0.1','--port','8111'])
+    launch('codex',8111,[str(root/'envs/sim/bin/python'),'-m','uvicorn','codex_bridge:app','--host','127.0.0.1','--port','8111'])
+    import urllib.request
+    with urllib.request.urlopen('http://127.0.0.1:8111/health',timeout=8) as response:
+        settings=json.load(response)
+    (run/'vlm_config.json').write_text(json.dumps(settings,indent=2))
     launch('policy',8000,['bash',str(code/'scripts/start_policy.sh')])
     with (run/'policy_warmup.json').open('w') as f:
         subprocess.run([str(root/'envs/sim/bin/python'),str(code/'scripts/policy_warmup.py')],env=env,stdout=f,check=True,timeout=240)

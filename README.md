@@ -1,6 +1,6 @@
 # VoLoAgent on RoboCasa
 
-Server deployment for the official RoboCasa365 `pi05_pretrain_human300` checkpoint with VoLoAgent and DeepSeek visual monitoring.
+Server deployment for the official RoboCasa365 `pi05_pretrain_human300` checkpoint with VoLoAgent and Codex Sol visual monitoring.
 
 Code is versioned here. Models, kitchen assets, environments, caches, API credentials, and run outputs stay outside this repository on the server.
 
@@ -30,7 +30,9 @@ envs/sim/bin/python code/scripts/download_model.py
 envs/sim/bin/python code/scripts/download_assets.py
 ```
 
-The DeepSeek API key belongs in `$ROBOCASA_ROOT/secrets/deepseek.key`, outside the code checkout. `DEEPSEEK_KEY_FILE` can select another file.
+The default VLM is `gpt-6.1-sol`, reasoning `high`, service tier `fast`, for both planning and monitoring. Run `bash scripts/start_codex_relay.sh` on the authenticated local computer before server episodes. The relay uses the existing Codex CLI login and forwards localhost port 18111 over SSH; credentials remain local. `CODEX_RELAY_PYTHON` selects a local Python with FastAPI, httpx and uvicorn. `CODEX_MODEL_CATALOG` can select a local model catalog. The server's `CODEX_BRIDGE_UPSTREAM` defaults to `http://127.0.0.1:18111`.
+
+Server startup checks relay health before loading the policy, and saves `vlm_config.json`. Visual requests and responses are recorded in each run's `codex_calls/`. Fast is requested explicitly; no task success or latency improvement is claimed by this configuration change. The old DeepSeek bridge remains only for historical reproducibility.
 
 For large public files, accessible CDN hosts can use direct connections while origins that need the VPN use the SSH proxy:
 
@@ -50,11 +52,11 @@ python "$REPRO_CODE_DIR/scripts/configure_macros.py"
 "$ROBOCASA_ROOT/envs/sim/bin/python" "$REPRO_CODE_DIR/scripts/run_episode.py" --task PickPlaceCounterToStove --seed 7 --video
 ```
 
-The launcher loads the model, verifies an inference call, starts DeepSeek and VoLoAgent, then runs one native episode. All services it starts are stopped afterward. It writes the result, policy chunks, VLM requests and responses, final images, and video under `$ROBOCASA_ROOT/runs/`.
+The launcher loads the model, verifies an inference call, starts the Codex bridge and VoLoAgent, then runs one native episode. All services it starts are stopped afterward. It writes the result, policy chunks, VLM requests and responses, final images, and video under `$ROBOCASA_ROOT/runs/`.
 
 The wall-clock limit is the native task horizon divided by the native control frequency, plus 20 seconds. It includes task-time VLA and VLM requests and simulation. Model loading/compilation and scene initialization happen before this timer. Video encoding happens afterward. Video shows simulation frames at the native frequency and omits reasoning waits.
 
-## First serial validation
+## First serial validation (historical DeepSeek configuration)
 
 - GPU: RTX PRO 6000 Blackwell Server Edition, about 96 GB.
 - Model: official RoboCasa365 `pi05_pretrain_human300`, revision in `configs/validated-versions.json`.
@@ -118,7 +120,7 @@ SAM3 and GraspGen run in the author's model server. The adapter handles calibrat
 
 The sparse-cloud patch preserves measured points when GraspGen's fixed outlier rule would leave fewer than 64. This handles small objects in 256px RGB-D observations without fabricating dense geometry or changing model weights. SAM3 also uses CUDA autocast and a local checkpoint path.
 
-This is asynchronous system execution. Cameras update with simulator steps, independently of the VLM worker. DeepSeek still receives one fixed observation set per request; new frames cannot enter an in-flight request. After command application and feedback publication, the next request takes the latest observation. Logs include the observation's simulator-return timestamp, its age when submitted and when a decision returns, and the latest available frame age. π is the original checkpoint, without RTC training; its asynchronous action chunks use an executed-action prefix offset. Buffer exhaustion produces a visible position hold.
+This is asynchronous system execution. Cameras update with simulator steps, independently of the VLM worker. The VLM still receives one fixed observation set per request; new frames cannot enter an in-flight request. After command application and feedback publication, the next request takes the latest observation. Logs include the observation's simulator-return timestamp, its age when submitted and when a decision returns, and the latest available frame age. π is the original checkpoint, without RTC training; its asynchronous action chunks use an executed-action prefix offset. Buffer exhaustion produces a visible position hold.
 
 `rollout_realtime.mp4` starts at the first non-hold control action and preserves wall time, including model/tool waits. A separate worker encodes timestamped frames, with no speed-up or removal of idle intervals. `result.json` includes first-action delay and both measured wall/video durations. Execution stops on native success, native step horizon, wall deadline, or a VLM stop, whichever comes first. The wall deadline remains native horizon/control rate plus 20 seconds, including initial task reasoning. `BreadAndCheese` has a 900-step horizon at 20 Hz (65-second wall limit) and requires both foods on the board and the gripper away.
 

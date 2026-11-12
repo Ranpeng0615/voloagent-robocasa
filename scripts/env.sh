@@ -23,3 +23,6 @@ fi
 export PATH="/root/miniconda3/bin:$PATH"
 export UV_HTTP_TIMEOUT=600
 export REPRO_PYPI_INDEX="${REPRO_PYPI_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
+
+# Inference stays on the authenticated local computer; SSH forwards this port.
+export CODEX_BRIDGE_UPSTREAM="${CODEX_BRIDGE_UPSTREAM:-http://127.0.0.1:18111}"

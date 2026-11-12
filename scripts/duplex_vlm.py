@@ -1,4 +1,4 @@
-"""Continuous high-level visual supervision using the configured DeepSeek bridge."""
+"""Continuous high-level visual supervision using Codex Sol high / Fast."""
 import base64
 import collections
 import io
@@ -135,7 +135,7 @@ def supervise(exchange, task, log):
     previous_view = None
     history=collections.deque(maxlen=64)
     last_response_error=None
-    with httpx.Client(timeout=httpx.Timeout(60, connect=5), trust_env=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(190, connect=5), trust_env=False) as client:
         while not exchange.stop.is_set():
             snapshot, guide = exchange.read()
             if snapshot is None or snapshot['step'] == previous_step:
@@ -168,15 +168,14 @@ def supervise(exchange, task, log):
                 'instruction':guide['instruction'],'left':snapshot['left'].copy(),'right':snapshot['right'].copy()})
             tick = time.monotonic()
             log.emit('vlm_begin', observed_step=snapshot['step'], revision=guide['revision'],
-                request_kind=request_kind,thinking='max' if planning else 'disabled',
+                request_kind=request_kind,thinking='high',model='gpt-6.1-sol',service_tier='fast',
                 observed_wall_s=snapshot['wall_s'],captured_at_monotonic=snapshot['captured_at_monotonic'],
                 frame_age_s=tick-snapshot['captured_at_monotonic'])
             try:
                 payload={
-                    'model':'deepseek-flash','messages':[{'role':'system','content':SYSTEM},
+                    'model':'gpt-6.1-sol','messages':[{'role':'system','content':SYSTEM},
                     {'role':'user','content':content}], 'response_format':{'type':'json_object'},
-                    'thinking':{'type':'enabled' if planning else 'disabled'},
-                    'reasoning_effort':'max' if planning else 'none'}
+                    'reasoning_effort':'high', 'service_tier':'fast'}
                 if not planning:payload['max_tokens']=1024
                 response = client.post('http://127.0.0.1:8111/v1/chat/completions',json=payload)
                 response.raise_for_status()
@@ -189,7 +188,7 @@ def supervise(exchange, task, log):
                 current, _ = exchange.read()
                 log.emit('vlm_end', observed_step=snapshot['step'], current_step=current['step'],
                     revision=guide['revision'], duration_s=time.monotonic()-tick, decision=decision,
-                    request_kind=request_kind,thinking='max' if planning else 'disabled',
+                    request_kind=request_kind,thinking='high',model='gpt-6.1-sol',service_tier='fast',
                     input_frame_age_s=time.monotonic()-snapshot['captured_at_monotonic'],
                     latest_frame_age_s=time.monotonic()-current['captured_at_monotonic'],
                     current_phase=current['feedback']['phase'])
