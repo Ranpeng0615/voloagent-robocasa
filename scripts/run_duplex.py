@@ -24,9 +24,9 @@ from robocasa.utils.dataset_registry_utils import get_task_horizon
 from robocasa.utils.env_utils import convert_action
 from robosuite.utils.camera_utils import get_camera_extrinsic_matrix, get_camera_intrinsic_matrix
 from duplex_core import EventLog, Exchange, TimedVideo
-from duplex_contract import executor_feedback, resolve_decision
+from duplex_contract import executor_feedback, resolve_decision, MOTION_TOOLS
 from duplex_vlm import supervise
-from robocasa_tools import make_plan, MotionExecutor
+from robocasa_tools import make_plan, perceive, MotionExecutor
 from whole_body import RobotKinematics
 
 
@@ -61,21 +61,22 @@ def policy_worker(exchange, jobs, results, log):
 
 def tool_worker(exchange,jobs,results,log):
     while not exchange.stop.is_set():
-        try: guide,snapshot,offset=jobs.get(timeout=.1)
+        try: guide,snapshot,grasp_pose=jobs.get(timeout=.1)
         except queue.Empty: continue
         if exchange.stop.is_set(): break
         _,current=exchange.read()
-        if current['revision']!=guide['revision']:
+        query=guide.get('query',False)
+        if not query and current['revision']!=guide['revision']:
             results.put(('tool',guide,snapshot,None,'cancelled_before_start'))
             continue
         tick=time.monotonic()
         log.emit('tool_prepare_begin',revision=guide['revision'],tool=guide['tool'],observed_step=snapshot['step'])
         try:
-            plan=make_plan(guide,snapshot,log,offset)
-            results.put(('tool',guide,snapshot,plan,None))
+            value=perceive(guide,snapshot,log) if query else make_plan(guide,snapshot,log,grasp_pose)
+            results.put(('query' if query else 'tool',guide,snapshot,value,None))
             log.emit('tool_prepare_end',revision=guide['revision'],tool=guide['tool'],duration_s=time.monotonic()-tick)
         except Exception as exc:
-            results.put(('tool',guide,snapshot,None,f'{type(exc).__name__}: {exc}'))
+            results.put(('query' if query else 'tool',guide,snapshot,None,f'{type(exc).__name__}: {exc}'))
             log.emit('tool_error',revision=guide['revision'],error=f'{type(exc).__name__}: {exc}')
 
 
@@ -87,7 +88,9 @@ class ExecutionState:
         self.motion=None
         self.phase='awaiting_policy'
         self.last_close=0.
-        self.held_offset=None
+        self.grasp_pose=None
+        self.latest_tool_result=None
+        self.query_count=0
         self.vla_pending=False
         self.tool_pending=False
         self.stale_results=0
@@ -103,20 +106,27 @@ class ExecutionState:
             self.log.emit('command_discarded',reason='obsolete_revision',step=step,command=command)
             return None
         try:
-            if guide['tool']=='grasp' and command.get('tool')!='grasp' and command.get('grasp_status') in {'failed','lost'}:
-                self.recent_events.append({'executor':'grasp','args':guide['args'],
-                    'status':'visual_failure','step':step})
             resolved=resolve_decision(command,guide,self.phase)
+            if resolved['command']=='call_tool' and self.tool_pending:
+                raise ValueError('Perception/motion preparation is still pending; see tool_pending')
         except ValueError as exc:
             self.last_guidance_result={'status':'rejected','reason':str(exc),'requested_command':command['command']}
             self.log.emit('command_rejected',step=step,command=command,reason=str(exc))
             return None
         kind=resolved['command']
-        self.last_visual_assessment={k:resolved.get(k) for k in ['progress','grasp_status','stage','target','reason']}
+        self.last_visual_assessment={k:resolved[k] for k in ['progress','grasp_status','stage','target','reason'] if k in resolved}
         self.last_visual_assessment['observed_step']=command.get('observed_step')
         self.last_guidance_result={'status':'applied','requested_command':command['command'],
             'effective_command':kind,'observed_step':command.get('observed_step'),
             'applied_step':step}
+        if kind=='call_tool':
+            self.query_count+=1
+            self.tool_pending=True
+            self.applied_commands+=1
+            request={**resolved,'revision':guide['revision'],'request_id':self.query_count,'query':True}
+            self.last_guidance_result.update(status='submitted',request_id=self.query_count)
+            self.log.emit('tool_query_submitted',step=step,request=request)
+            return request
         if kind=='continue':
             self.exchange.describe(resolved['instruction'])
             self.log.emit('continue',step=step,revision=guide['revision'],reason=command.get('reason'),
@@ -130,12 +140,22 @@ class ExecutionState:
         guide=self.exchange.revise(tool,resolved['instruction'],resolved['args'])
         count=len(self.actions)
         self.actions.clear(); self.motion=None
-        self.phase='holding' if tool=='hold' else 'preparing' if tool in {'grasp','place'} else 'awaiting_policy'
+        self.phase='holding' if tool=='hold' else 'preparing' if tool in MOTION_TOOLS else 'awaiting_policy'
         self.applied_commands+=1
         self.log.emit('command_applied',step=step,previous_revision=previous,revision=guide['revision'],
             cleared_actions=count,delivery_latency_s=time.monotonic()-command['received_at'],
             effective_command=kind,command=command)
         return guide
+
+    def query_result(self, request, source, value, error, step):
+        """Read-only results retain observation age; they never change motion."""
+        self.tool_pending=False
+        self.latest_tool_result={'request_id':request['request_id'],'tool':request['tool'],
+            'args':request['args'],'observed_step':source['step'],
+            'observed_wall_s':source.get('wall_s'),
+            'status':'failed' if error else 'completed','error':error,'result':value}
+        if not error and request['tool']=='graspgen':self.grasp_pose=value
+        self.log.emit('tool_query_result',step=step,**self.latest_tool_result)
 
     def hold(self):
         action=np.zeros(12);action[6]=self.last_close
@@ -175,14 +195,14 @@ def main():
     log=EventLog(run/'duplex_events.jsonl')
     exchange=Exchange(instruction);execution=ExecutionState(exchange,log)
     # Start VLA immediately on the native task instruction. VLM supervises in
-    # parallel; geometric tools are recovery options after observed problems.
+    # parallel and chooses individual perception or motion tools itself.
     jobs=queue.Queue(maxsize=1);tools=queue.Queue(maxsize=1);results=queue.Queue()
     report={'task':args.task,'split':args.split,'seed':args.seed,'instruction':instruction,
         'horizon':horizon,'control_hz':hz,'wall_limit_s':limit,'steps':0,'success':False,
         'wall_timeout':False,'checkpoint':'pi05_pretrain_human300','online_gt_state':False,
-        'mode':'duplex','initial_executor':'vla','tool_selection':'recovery_only',
+        'mode':'duplex','initial_executor':'vla','tool_selection':'vlm_orchestrated_primitives',
         'env_step_s':0.,'hold_steps':0,'vla_steps':0,'tool_steps':0,
-        'tools_available':['vla','sam3','graspgen','grasp','place'],
+        'tools_available':['vla','sam3','graspgen','move_ee','gripper','hold'],
         'motion_planner':'native_whole_body_differential_ik','recorder':'wall_clock_from_first_action'}
     start=time.monotonic();video=TimedVideo(run/'rollout_realtime.mp4',log) if args.video else None
     first_action=None
@@ -216,6 +236,7 @@ def main():
             'K':get_camera_intrinsic_matrix(raw.sim,'robot0_agentview_left',h,w),
             'T_camera':get_camera_extrinsic_matrix(raw.sim,'robot0_agentview_left'),
             'views':views,'ee_pos':ee[:3,3].copy(),'ee_rot':ee[:3,:3].copy(),
+            'gripper_command':execution.last_close,
             'T_hand_to_site':np.linalg.inv(hand)@ee,
             'controller_origin_rot':c.origin_ori.copy(),
             'controller_scale':((c.output_max-c.output_min)/(c.input_max-c.input_min)).copy(),
@@ -248,7 +269,9 @@ def main():
                 if applied=='stop':
                     report['stopped_by_vlm']=True
                     break
-                if isinstance(applied,dict) and applied['tool'] in {'grasp','place'}:
+                if isinstance(applied,dict) and applied.get('query'):
+                    tools.put_nowait((applied,current,execution.grasp_pose))
+                elif isinstance(applied,dict) and applied['tool'] in MOTION_TOOLS:
                     if execution.tool_pending:
                         # A cancelled GPU request may finish, but its result is
                         # version-checked. The new request starts once it clears.
@@ -260,6 +283,9 @@ def main():
                 except queue.Empty: break
                 if kind=='vla': execution.vla_pending=False
                 else: execution.tool_pending=False
+                if kind=='query':
+                    execution.query_result(result_guide,source,value,error,report['steps'])
+                    continue
                 if not execution.accepts(result_guide['revision'],kind,report['steps']):
                     continue
                 if error:
@@ -286,7 +312,6 @@ def main():
                             'actions':value.tolist()})+'\n')
                 else:
                     execution.motion=MotionExecutor(value)
-                    if value.held_offset is not None: execution.held_offset=value.held_offset
                     execution.phase=execution.motion.phase
                     log.emit('tool_motion_begin',tool=value.name,revision=guide['revision'],step=report['steps'],evidence=value.evidence)
             # Refresh robot/feedback state after command and result application.
@@ -294,17 +319,16 @@ def main():
             for command in commands:exchange.acknowledge(command.get('command_id',0))
             if guide['tool']=='vla' and len(execution.actions)<=2 and not execution.vla_pending:
                 jobs.put_nowait((guide,current));execution.vla_pending=True
-            if guide['tool'] in {'grasp','place'} and execution.motion is None and not execution.tool_pending and execution.phase in {'preparing','waiting_for_cancelled_inference'}:
-                tools.put_nowait((guide,current,execution.held_offset));execution.tool_pending=True
+            if guide['tool'] in MOTION_TOOLS and execution.motion is None and not execution.tool_pending and execution.phase in {'preparing','waiting_for_cancelled_inference'}:
+                tools.put_nowait((guide,current,execution.grasp_pose));execution.tool_pending=True
             action=execution.hold();source='hold'
             if guide['tool']=='vla' and execution.actions:
                 action=execution.actions.popleft();source='vla'
-            elif guide['tool'] in {'grasp','place'} and execution.motion is not None:
+            elif guide['tool'] in MOTION_TOOLS and execution.motion is not None:
                 motion_action=execution.motion.tick(current)
                 execution.phase=execution.motion.phase
                 if motion_action is not None: action=motion_action;source='tool'
                 elif execution.motion.status!='moving':
-                    if execution.phase!='motion_done_unverified': execution.held_offset=None
                     if not getattr(execution.motion,'reported',False):
                         execution.motion.reported=True
                         event={'executor':guide['tool'],'args':guide['args'],

@@ -73,10 +73,6 @@ def whole_body_action(snapshot, dp, dr, close, anchor, base_enabled=True):
     caps=np.array([.12,.12,.25,.03]+[1.]*7)*dt
     lower=np.maximum(-caps,np.minimum(caps,k['limits'][:,0]-q))
     upper=np.minimum(caps,np.maximum(-caps,k['limits'][:,1]-q))
-    # Local repositioning around the tool's starting base, not room navigation.
-    budget=np.array([.35,.35,.5])
-    lower[:3]=np.maximum(lower[:3],np.clip(anchor-budget-q[:3],-caps[:3],caps[:3]))
-    upper[:3]=np.minimum(upper[:3],np.clip(anchor+budget-q[:3],-caps[:3],caps[:3]))
     if not base_enabled:lower[:3]=upper[:3]=0.
     desired=np.r_[limit_norm(dp,.010),limit_norm(dr,.080)]
     task_weight=np.array([1.,1.,1.,.2,.2,.2])

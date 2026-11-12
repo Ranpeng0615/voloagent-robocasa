@@ -3,6 +3,7 @@ import sys
 from itertools import product
 import json
 import threading
+import queue
 from pathlib import Path
 import tempfile
 import time
@@ -13,8 +14,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from duplex_core import Exchange, EventLog, TimedVideo
 from duplex_vlm import parse_decision, supervise
 from duplex_contract import executor_feedback
-from run_duplex import ExecutionState, policy_wire
-from robocasa_tools import MotionExecutor, ToolPlan, Waypoint, make_plan
+from run_duplex import ExecutionState, policy_wire, tool_worker
+from robocasa_tools import MotionExecutor, ToolPlan, Waypoint, make_plan, perceive
 
 
 class DuplexControlTests(unittest.TestCase):
@@ -29,8 +30,7 @@ class DuplexControlTests(unittest.TestCase):
     def command(self, command, tool='vla', revision=0, **extra):
         return {'command':command,'tool':tool,'based_revision':revision,'received_at':time.monotonic(),
                 'instruction':'retry grasping bread','args':{},
-                'progress':'stalled' if tool in {'grasp','place'} else 'normal',
-                'stage':'place' if tool=='place' else 'acquire','grasp_status':'unverified','target':'bread',
+                'progress':'normal','stage':'acquire','grasp_status':'unverified','target':'bread',
                 'reason':'Object remained on its support over repeated observations',**extra}
 
     def test_refine_flushes_immediately_without_waiting_for_inflight_vla(self):
@@ -45,7 +45,7 @@ class DuplexControlTests(unittest.TestCase):
 
     def test_stale_high_level_command_cannot_restart_cancelled_tool(self):
         self.owner.apply(self.command('hold',tool='hold'),21)
-        stale=self.command('switch_tool',tool='grasp',args={'target':'bread'})
+        stale=self.command('switch_tool',tool='move_ee',args={'pose_ref':'current','offset_world':[0,0,.05]})
         self.assertIsNone(self.owner.apply(stale,22))
         self.assertEqual(self.bus.guide['tool'],'hold')
         self.assertEqual(self.bus.guide['revision'],1)
@@ -87,35 +87,36 @@ class DuplexControlTests(unittest.TestCase):
         self.assertTrue(self.owner.vla_pending)
 
     def test_continue_tool_change_is_applied_as_switch(self):
-        guide=self.owner.apply(self.command('continue',tool='grasp',args={'target':'bread'}),42)
-        self.assertEqual(guide['tool'],'grasp')
+        guide=self.owner.apply(self.command('continue',tool='move_ee',args={'pose_ref':'current','offset_world':[0,0,.05]}),42)
+        self.assertEqual(guide['tool'],'move_ee')
         self.assertEqual(self.owner.phase,'preparing')
         self.assertEqual(self.owner.last_guidance_result['effective_command'],'switch_tool')
 
-    def test_continue_new_geometric_target_restarts_but_new_description_does_not(self):
-        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
-        motion=object();self.owner.motion=motion;self.owner.phase='approach'
-        self.owner.apply(self.command('continue',tool='grasp',revision=1,
-            instruction='Approach the bread carefully',args={'target':'bread'}),41)
+    def test_continue_new_pose_restarts_but_new_description_does_not(self):
+        args={'pose_ref':'current','offset_world':[0,0,.05]}
+        self.owner.apply(self.command('switch_tool',tool='move_ee',args=args),40)
+        motion=object();self.owner.motion=motion;self.owner.phase='move_ee'
+        self.owner.apply(self.command('continue',tool='move_ee',revision=1,
+            instruction='Move toward the requested pose',args=args),41)
         self.assertIs(self.owner.motion,motion)
         self.assertEqual(self.bus.guide['revision'],1)
-        self.assertEqual(self.bus.guide['instruction'],'Approach the bread carefully')
-        guide=self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'cheese'}),42)
-        self.assertEqual(guide['args'],{'target':'cheese'})
+        guide=self.owner.apply(self.command('continue',tool='move_ee',revision=1,
+            args={'pose_ref':'current','offset_world':[0,0,.08]}),42)
+        self.assertEqual(guide['args']['offset_world'],[0,0,.08])
         self.assertEqual(guide['revision'],2)
         self.assertIsNone(self.owner.motion)
 
     def test_unchanged_continue_cannot_resume_failed_or_finished_tool(self):
-        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
-        for phase in ['failed_above_target','motion_done_unverified']:
+        self.owner.apply(self.command('switch_tool',tool='move_ee',args={'pose_ref':'current','offset_world':[0,0,.05]}),40)
+        for phase in ['failed_move_ee','motion_done_unverified']:
             self.owner.phase=phase
-            self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'bread'}),41)
+            self.owner.apply(self.command('continue',tool='move_ee',revision=1,args={'pose_ref':'current','offset_world':[0,0,.05]}),41)
             self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
             self.assertEqual(self.bus.guide['revision'],1)
             self.assertEqual(self.owner.phase,phase)
 
     def test_continue_cannot_bypass_required_tool_arguments(self):
-        self.owner.apply(self.command('continue',tool='grasp'),42)
+        self.owner.apply(self.command('continue',tool='move_ee'),42)
         self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
         self.assertEqual(self.bus.guide['tool'],'vla')
 
@@ -136,30 +137,93 @@ class DuplexControlTests(unittest.TestCase):
                 effective=self.owner.last_guidance_result['effective_command']
                 self.assertEqual(effective,'switch_tool' if command=='continue' and tool!=previous_tool else command)
 
-    def test_vlm_selects_grasp_recovery_and_clears_previous_actions(self):
+    def test_motion_selection_clears_previous_actions(self):
         self.owner.actions.extend([np.ones(12) for _ in range(5)])
-        guide=self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},
-            progress='failed',grasp_status='failed'),42)
-        self.assertEqual(guide['tool'],'grasp')
-        self.assertEqual(guide['args'],{'target':'bread'})
+        guide=self.owner.apply(self.command('switch_tool',tool='move_ee',
+            args={'pose_ref':'current','offset_world':[0,0,.05]},progress='failed',grasp_status='failed'),42)
+        self.assertEqual(guide['tool'],'move_ee')
         self.assertFalse(self.owner.actions)
         self.assertEqual(self.owner.phase,'preparing')
 
-    def test_normal_place_after_grasp_is_not_rejected_as_non_recovery(self):
-        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
+    def test_gripper_to_move_has_no_holding_or_failure_gate(self):
+        self.owner.apply(self.command('switch_tool',tool='gripper',args={'command':'close'}),40)
         self.owner.phase='motion_done_unverified'
-        guide=self.owner.apply(self.command('switch_tool',tool='place',revision=1,
-            args={'destination':'bowl'},progress='normal',grasp_status='confirmed'),42)
-        self.assertEqual(guide['tool'],'place')
-        self.assertEqual(guide['args'],{'destination':'bowl'})
+        guide=self.owner.apply(self.command('switch_tool',tool='move_ee',revision=1,
+            args={'position_world':[.2,.1,1.]},progress='normal',grasp_status='unverified'),42)
+        self.assertEqual(guide['tool'],'move_ee')
         self.assertEqual(self.owner.last_guidance_result['status'],'applied')
 
-    def test_failed_target_history_does_not_force_executor_choice(self):
-        self.owner.recent_events.append({'executor':'grasp','args':{'target':'bread'},'status':'failed_above_target'})
-        guide=self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),42)
-        self.assertEqual(guide['tool'],'grasp')
-        guide=self.owner.apply(self.command('refine',revision=1,progress='failed',grasp_status='failed'),43)
-        self.assertEqual(guide['tool'],'vla')
+    def test_perception_and_its_result_do_not_change_vla_actions_or_gripper(self):
+        self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
+        self.owner.last_close=1.
+        request=self.owner.apply(self.command('call_tool',tool='graspgen',args={'target':'bowl'}),42)
+        self.assertTrue(request['query'])
+        self.assertEqual(self.bus.guide['revision'],0)
+        self.assertEqual(self.bus.guide['tool'],'vla')
+        self.assertEqual(len(self.owner.actions),1)
+        self.assertTrue(self.owner.vla_pending)
+        value={'pose_ref':'grasp:1','position_world':[0,0,1.],'quaternion_xyzw':[0,0,0,1]}
+        # Even if VLM revises VLA during a query, a tagged read-only result can
+        # be reported. It cannot start motion or change the new instruction.
+        self.owner.apply(self.command('refine'),43)
+        self.owner.actions.append(np.ones(12))
+        self.owner.query_result(request,{'step':42,'wall_s':2.1},value,None,45)
+        self.assertEqual(self.bus.guide['revision'],1)
+        self.assertEqual(self.bus.guide['tool'],'vla')
+        self.assertEqual(len(self.owner.actions),1)
+        self.assertIsNone(self.owner.motion)
+        self.assertEqual(self.owner.last_close,1.)
+        self.assertEqual(self.owner.grasp_pose,value)
+        self.assertEqual(self.owner.latest_tool_result['observed_step'],42)
+
+    def test_perception_failure_reports_error_without_cancelling_active_motion(self):
+        self.owner.apply(self.command('switch_tool',tool='move_ee',args={'position_world':[0,0,1.]}),40)
+        motion=object();self.owner.motion=motion;self.owner.phase='move_ee'
+        request=self.owner.apply(self.command('call_tool',tool='sam3',revision=1,args={'target':'bowl'}),41)
+        self.owner.query_result(request,{'step':41},None,'No usable segmentation',42)
+        self.assertIs(self.owner.motion,motion)
+        self.assertEqual(self.owner.phase,'move_ee')
+        self.assertEqual(self.owner.latest_tool_result['status'],'failed')
+        self.assertFalse(self.owner.tool_pending)
+
+    def test_slow_query_worker_does_not_block_observations_or_vla(self):
+        entered=threading.Event();release=threading.Event()
+        self.bus.publish({'step':1})
+        self.owner.actions.extend([np.ones(12) for _ in range(5)])
+        request=self.owner.apply(self.command('call_tool',tool='sam3',args={'target':'bowl'}),1)
+        jobs=queue.Queue();results=queue.Queue()
+        def infer(*args):
+            entered.set()
+            if not release.wait(3):raise TimeoutError('query test timed out')
+            return {'request_id':1,'observed_step':1}
+        with mock.patch('run_duplex.perceive',side_effect=infer):
+            thread=threading.Thread(target=tool_worker,args=(self.bus,jobs,results,self.log),daemon=True)
+            thread.start()
+            try:
+                jobs.put((request,{'step':1},None))
+                self.assertTrue(entered.wait(3))
+                for step in range(2,6):
+                    self.bus.publish({'step':step})
+                    self.owner.actions.popleft()
+                self.assertEqual(self.bus.read()[0]['step'],5)
+                self.assertEqual(self.bus.guide['tool'],'vla')
+                release.set()
+                kind,returned,source,value,error=results.get(timeout=3)
+                self.assertEqual(kind,'query')
+                self.owner.query_result(returned,source,value,error,5)
+                self.assertEqual(self.owner.latest_tool_result['observed_step'],1)
+                self.assertEqual(len(self.owner.actions),1)
+                self.assertEqual(self.bus.guide['revision'],0)
+            finally:
+                release.set();self.bus.stop.set();thread.join(3)
+        self.assertFalse(thread.is_alive())
+
+    def test_busy_query_is_rejected_without_cancelling_active_motion(self):
+        self.owner.apply(self.command('call_tool',tool='sam3',args={'target':'bowl'}),41)
+        self.owner.apply(self.command('call_tool',tool='graspgen',args={'target':'bowl'}),42)
+        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
+        self.assertEqual(self.bus.guide['tool'],'vla')
+        self.assertEqual(self.bus.guide['revision'],0)
 
     def test_native_gripper_sign_and_rolling_buffer_are_explicit(self):
         self.owner.last_close=-.999212
@@ -252,7 +316,7 @@ class DuplexControlTests(unittest.TestCase):
 
     def test_geometric_action_uses_native_rotated_base_frame(self):
         goal=Waypoint('approach',np.array([.02,0,0]),np.eye(3),1.)
-        motion=MotionExecutor(ToolPlan('grasp',[goal],{}))
+        motion=MotionExecutor(ToolPlan('move_ee',[goal],{}))
         origin=np.array([[0,-1,0],[1,0,0],[0,0,1]])
         action=motion.tick({'ee_pos':np.zeros(3),'ee_rot':np.eye(3),
             'controller_origin_rot':origin,'controller_scale':np.array([.05]*3+[.5]*3)})
@@ -261,12 +325,12 @@ class DuplexControlTests(unittest.TestCase):
         self.assertEqual(action[6],1)
 
     def test_completed_motion_is_not_reported_as_verified_grasp(self):
-        motion=MotionExecutor(ToolPlan('grasp',[Waypoint('lift',np.zeros(3),np.eye(3),1.)],{}))
+        motion=MotionExecutor(ToolPlan('move_ee',[Waypoint('lift',np.zeros(3),np.eye(3),1.)],{}))
         action=motion.tick({'ee_pos':np.zeros(3),'ee_rot':np.eye(3)})
         self.assertIsNone(action)
         self.assertEqual(motion.status,'motion_done_unverified')
 
-    def test_high_initial_arm_does_not_force_unreachable_horizontal_approach(self):
+    def test_graspgen_returns_pose_without_a_robot_action_sequence(self):
         pose=np.eye(4);pose[:3,:3]=np.diag([1,-1,-1]);pose[2,3]=.9
         client=mock.Mock()
         client.detect_and_segment.return_value=(np.ones((16,16),bool),.9,(0,0,16,16))
@@ -274,14 +338,54 @@ class DuplexControlTests(unittest.TestCase):
         mount=np.eye(4);mount[2,3]=.097
         snap={'step':0,'left':np.zeros((16,16,3),np.uint8),'depth':np.full((16,16),.8),
             'K':np.array([[16,0,8],[0,16,8],[0,0,1]]),'T_camera':np.eye(4),
-            'ee_pos':np.array([-.3,0,1.3]),'ee_rot':np.diag([1,-1,-1]),'T_hand_to_site':mount}
+            'ee_pos':np.array([-.3,0,1.3]),'ee_rot':np.diag([1,-1,-1]),'T_hand_to_site':mount,
+            'gripper_command':1.}
         with mock.patch.dict('os.environ',{'RUN_DIR':self.temp.name}):
-            plan=make_plan({'tool':'grasp','revision':1,'args':{'target':'vegetable'}},snap,self.log,client=client)
-        above=next(w for w in plan.waypoints if w.phase=='above_target')
-        self.assertLess(above.pos[2],1.1)
-        self.assertGreater(above.pos[2],.8)
-        grasp=next(w for w in plan.waypoints if w.phase=='approach')
-        self.assertAlmostEqual(grasp.pos[2],.803)
+            result=perceive({'tool':'graspgen','revision':0,'request_id':1,'args':{'target':'bowl'}},snap,self.log,client=client)
+        self.assertAlmostEqual(result['position_world'][2],.803)
+        self.assertEqual(result['pose_ref'],'grasp:1')
+        self.assertNotIn('waypoints',result)
+        self.assertFalse(client.compute_grasp.call_args.kwargs['enable_topdown_filter'])
+        plan=make_plan({'tool':'move_ee','revision':1,'args':{'pose_ref':'grasp:1'}},snap,self.log,result)
+        self.assertEqual(len(plan.waypoints),1)
+        goal=plan.waypoints[0]
+        self.assertEqual(goal.phase,'move_ee')
+        self.assertAlmostEqual(goal.pos[2],.803)
+        self.assertEqual(goal.close,1.)
+        self.assertIsNone(goal.timeout_s)
+
+    def test_pose_offset_and_gripper_change_only_when_requested(self):
+        snap={'ee_pos':np.array([1.,2.,3.]),'ee_rot':np.eye(3),'gripper_command':1.}
+        plan=make_plan({'tool':'move_ee','revision':1,'args':{
+            'pose_ref':'current','offset_world':[0,0,.03]}},snap,self.log)
+        np.testing.assert_allclose(plan.waypoints[0].pos,[1,2,3.03])
+        self.assertEqual(plan.waypoints[0].close,1.)
+        plan=make_plan({'tool':'move_ee','revision':1,'args':{
+            'position_world':[1,2,3],'gripper':'open','timeout_s':2.}},snap,self.log)
+        self.assertEqual(plan.waypoints[0].close,0.)
+        self.assertEqual(plan.waypoints[0].timeout_s,2.)
+        with self.assertRaises(ValueError):
+            make_plan({'tool':'move_ee','revision':1,'args':{'pose_ref':'grasp:99'}},snap,self.log)
+
+    def test_gripper_does_not_add_lift_or_transport(self):
+        snap={'ee_pos':np.zeros(3),'ee_rot':np.eye(3),'gripper_command':0.}
+        plan=make_plan({'tool':'gripper','revision':1,'args':{'command':'close','duration_s':.1}},snap,self.log)
+        motion=MotionExecutor(plan)
+        with mock.patch('robocasa_tools.time.monotonic',return_value=motion.started+.05):
+            action=motion.tick(snap)
+        self.assertEqual(action[6],1.)
+        np.testing.assert_array_equal(np.delete(action,6),np.zeros(11))
+        with mock.patch('robocasa_tools.time.monotonic',return_value=motion.started+.2):
+            self.assertIsNone(motion.tick(snap))
+        self.assertEqual(motion.status,'motion_done_unverified')
+
+    def test_motion_at_goal_still_applies_explicit_gripper_change(self):
+        snap={'ee_pos':np.zeros(3),'ee_rot':np.eye(3),'gripper_command':0.}
+        plan=make_plan({'tool':'move_ee','revision':1,'args':{
+            'pose_ref':'current','gripper':'close'}},snap,self.log)
+        action=MotionExecutor(plan).tick(snap)
+        self.assertEqual(action[6],1.)
+        np.testing.assert_array_equal(np.delete(action,6),np.zeros(11))
 
     def test_video_keeps_wall_clock_pause(self):
         import cv2
@@ -298,7 +402,7 @@ class DuplexControlTests(unittest.TestCase):
 
     def test_invalid_tool_decision_is_rejected(self):
         with self.assertRaises(ValueError):
-            parse_decision('{"command":"switch_tool","tool":"grasp","args":{}}')
+            parse_decision('{"command":"call_tool","tool":"graspgen","args":{}}')
 
 
 if __name__=='__main__': unittest.main()

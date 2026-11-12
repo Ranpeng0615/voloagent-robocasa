@@ -48,13 +48,19 @@ class WholeBodyTests(unittest.TestCase):
         action,_=whole_body_action(snap,np.array([0,0,.1]),np.zeros(3),0,np.zeros(3))
         self.assertEqual(action[10],0)
 
-    def test_local_base_budget_prevents_further_outward_motion(self):
+    def test_native_base_joint_limit_prevents_outward_motion(self):
         snap=self.snapshot();snap['kinematics']['q'][0]=.35
+        snap['kinematics']['limits'][0]=[0,.35]
         action,_=whole_body_action(snap,np.array([.1,0,0]),np.zeros(3),0,np.zeros(3))
         self.assertLessEqual(action[7],1e-8)
 
+    def test_no_adapter_displacement_budget_blocks_base_motion(self):
+        snap=self.snapshot();snap['kinematics']['q'][0]=.4
+        action,_=whole_body_action(snap,np.array([.1,0,0]),np.zeros(3),0,np.zeros(3))
+        self.assertGreater(action[7],0)
+
     def test_tool_executor_uses_whole_body_solver(self):
-        motion=MotionExecutor(ToolPlan('grasp',[Waypoint('above_target',np.array([.1,0,0]),np.eye(3),0)],{}))
+        motion=MotionExecutor(ToolPlan('move_ee',[Waypoint('move_ee',np.array([.1,0,0]),np.eye(3),0)],{}))
         action=motion.tick(self.snapshot())
         self.assertGreater(action[7],0)
         self.assertEqual(motion.tracking_error['ik_mode'],'whole_body_differential')
