@@ -159,8 +159,9 @@ class DuplexControlTests(unittest.TestCase):
     def test_perception_and_its_result_do_not_change_vla_actions_or_gripper(self):
         self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
         self.owner.last_close=1.
-        request=self.owner.apply(self.command('call_tool',tool='graspgen',args={'target':'bowl'}),42)
+        request=self.owner.apply(self.command('switch_tool',tool='graspgen',args={'target':'bowl'}),42)
         self.assertTrue(request['query'])
+        self.assertEqual(self.owner.last_guidance_result['effective_command'],'call_tool')
         self.assertEqual(self.bus.guide['revision'],0)
         self.assertEqual(self.bus.guide['tool'],'vla')
         self.assertEqual(len(self.owner.actions),1)
@@ -412,6 +413,32 @@ class DuplexControlTests(unittest.TestCase):
         for command in ['call_tool','switch_tool']:
             with self.assertRaises(ValueError):
                 parse_decision(json.dumps({'command':command,'args':{'target':'bowl'}}),'vla')
+
+    def test_response_argument_error_is_visible_to_the_next_model_call(self):
+        requests=[]
+        def frame(step):
+            return {'step':step,'wall_s':step,'captured_at_monotonic':time.monotonic(),
+                'feedback':{'phase':'executing'},
+                **{k:np.zeros((16,16,3),np.uint8) for k in ['left','right','wrist']}}
+        def post(url,**kwargs):
+            requests.append(kwargs['json'])
+            response=mock.Mock()
+            if len(requests)==1:
+                decision={'command':'switch_tool','tool':'sam3','args':{}}
+                self.bus.publish(frame(1))
+            else:
+                decision={'command':'continue','tool':'vla','instruction':''}
+                self.bus.stop.set()
+            response.json.return_value={'choices':[{'message':{'content':json.dumps(decision)}}]}
+            return response
+        self.bus.publish(frame(0))
+        with mock.patch('duplex_vlm.httpx.Client') as client:
+            client.return_value.__enter__.return_value.post.side_effect=post
+            supervise(self.bus,'pick bread',self.log)
+        self.assertEqual(len(requests),2)
+        state=json.loads(requests[1]['messages'][1]['content'][0]['text'])
+        self.assertIn('Missing tool argument: target',state['last_response_error'])
+        self.assertEqual(self.bus.guide['tool'],'vla')
 
     def test_historical_visual_baseline_is_retained_across_goal_changes(self):
         history=[{'step':0,'wall_s':0,'instruction':'pick bread'},

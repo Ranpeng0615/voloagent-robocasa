@@ -84,6 +84,9 @@ source observation time. feedback.grasp_pose retains the latest successful grasp
 prediction and its pose_ref, even after another query. Neither query results nor
 failure reports automatically change the executor. Decide whether to hold for
 perception or continue moving, and whether a predicted pose still fits the images.
+For sam3/graspgen, switch_tool is also accepted as a query alias; it has the same
+read-only behavior. A previous response validation error, if any, is supplied in
+last_response_error; correct its missing/invalid arguments on the next call.
 
 continue keeps the active motion and instruction when instruction is empty.
 An explicitly changed VLA instruction still applies as refine;
@@ -131,6 +134,7 @@ def supervise(exchange, task, log):
     previous_step = -1
     previous_view = None
     history=collections.deque(maxlen=64)
+    last_response_error=None
     with httpx.Client(timeout=httpx.Timeout(60, connect=5), trust_env=False) as client:
         while not exchange.stop.is_set():
             snapshot, guide = exchange.read()
@@ -148,6 +152,7 @@ def supervise(exchange, task, log):
                 'frame_age_at_pack_s':time.monotonic()-snapshot['captured_at_monotonic'],
                 'request_kind':request_kind, 'initial_plan':initial_plan,
                 'progress_reference':reference_info,
+                'last_response_error':last_response_error,
                 'active':guide, 'feedback':snapshot['feedback'], 'memory':memory},ensure_ascii=False)
             content = [{'type':'text','text':text}]
             for name, label in [('left','Left external'),('right','Right external'),('wrist','Wrist')]:
@@ -177,6 +182,7 @@ def supervise(exchange, task, log):
                 response.raise_for_status()
                 raw = response.json()['choices'][0]['message']['content']
                 decision = parse_decision(raw,guide['tool'])
+                last_response_error=None
                 if planning:
                     plan=decision.get('plan')
                     initial_plan=plan if isinstance(plan,list) and plan and all(isinstance(s,str) and s.strip() for s in plan) else [task]
@@ -197,5 +203,6 @@ def supervise(exchange, task, log):
                 with exchange.condition:
                     exchange.condition.wait_for(lambda: exchange.acknowledged>=command_id or exchange.stop.is_set())
             except Exception as exc:
+                last_response_error=f'{type(exc).__name__}: {exc}'
                 log.emit('vlm_error', error=f'{type(exc).__name__}: {exc}',duration_s=time.monotonic()-tick)
                 exchange.stop.wait(.3)

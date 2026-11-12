@@ -66,8 +66,6 @@ def validate_decision(value):
             raise ValueError('call_tool is for sam3/graspgen queries')
         validate_tool_args(tool, value.get('args', {}))
     elif value['command'] == 'switch_tool':
-        if tool in PERCEPTION_TOOLS:
-            raise ValueError('Use call_tool for perception without changing the active executor')
         validate_tool_args(tool, value.get('args', {}))
     return value
 
@@ -91,7 +89,7 @@ def resolve_decision(value, active, phase):
             raise ValueError('No active motion to continue; select or restart an executor')
     if kind == 'switch_tool':
         if tool in PERCEPTION_TOOLS:
-            raise ValueError('Use call_tool for sam3/graspgen')
+            kind = 'call_tool'
         validate_tool_args(tool, args)
     result.update(command=kind, tool=tool, instruction=instruction, args=dict(args))
     return result
