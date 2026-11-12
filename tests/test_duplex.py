@@ -1,5 +1,6 @@
 """Control invariants that matter when inference and motion overlap."""
 import sys
+from itertools import product
 import json
 import threading
 from pathlib import Path
@@ -118,78 +119,47 @@ class DuplexControlTests(unittest.TestCase):
         self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
         self.assertEqual(self.bus.guide['tool'],'vla')
 
-    def test_geometric_tool_requires_reported_progress_problem(self):
-        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},progress='normal'),42)
-        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
-        self.assertEqual(self.bus.guide['tool'],'vla')
+    def test_visual_assessments_do_not_override_vlm_continue_refine_or_hold(self):
+        assessments=product(['normal','uncertain','stalled','failed'],
+            ['unverified','confirmed','failed','lost'],['acquire','transport','place'],
+            [('continue','vla'),('refine','vla'),('hold','hold')])
+        for progress,grasp_status,stage,(command,tool) in assessments:
+            with self.subTest(progress=progress,grasp_status=grasp_status,stage=stage,command=command):
+                previous_tool=self.bus.guide['tool']
+                revision=self.bus.guide['revision']
+                instruction=self.bus.guide['instruction'] if command=='continue' else 'carry bread to bowl'
+                self.owner.apply(self.command(command,tool=tool,revision=revision,
+                    instruction=instruction,progress=progress,grasp_status=grasp_status,
+                    stage=stage,target=''),42)
+                self.assertEqual(self.bus.guide['tool'],tool)
+                self.assertEqual(self.owner.last_guidance_result['status'],'applied')
+                effective=self.owner.last_guidance_result['effective_command']
+                self.assertEqual(effective,'switch_tool' if command=='continue' and tool!=previous_tool else command)
 
-    def test_initial_observation_cannot_replace_vla_with_geometric_tool(self):
-        self.owner.actions.append(np.ones(12))
-        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},
-            progress='failed',observed_step=0),42)
-        self.assertEqual(self.owner.last_guidance_result['status'],'rejected')
-        self.assertEqual(self.bus.guide['tool'],'vla')
-        self.assertEqual(len(self.owner.actions),1)
-
-    def test_failed_vla_grasp_clears_actions_and_switches_to_grasp(self):
+    def test_vlm_selects_grasp_recovery_and_clears_previous_actions(self):
         self.owner.actions.extend([np.ones(12) for _ in range(5)])
-        guide=self.owner.apply(self.command('continue',instruction='pick bread',
+        guide=self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'},
             progress='failed',grasp_status='failed'),42)
         self.assertEqual(guide['tool'],'grasp')
         self.assertEqual(guide['args'],{'target':'bread'})
         self.assertFalse(self.owner.actions)
         self.assertEqual(self.owner.phase,'preparing')
-        self.assertEqual(self.owner.last_guidance_result['guard_reason'],'failed_vla_grasp_try_grasp_tool')
 
-    def test_unverified_transport_is_held_and_old_actions_invalidated(self):
-        self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
-        guide=self.owner.apply(self.command('refine',instruction='carry bread to bowl',
-            stage='transport',grasp_status='unverified'),42)
-        self.assertEqual(guide['tool'],'hold')
-        self.assertFalse(self.owner.actions)
-        self.assertFalse(self.owner.accepts(0,'vla',43))
-        self.assertIn('holding_unverified',self.owner.last_guidance_result['guard_reason'])
-
-    def test_failed_grasp_cannot_evade_tool_recovery_with_new_wording(self):
-        guide=self.owner.apply(self.command('continue',instruction='open and regrasp bread only',
-            progress='failed',grasp_status='failed',stage='acquire'),42)
-        self.assertEqual(guide['tool'],'grasp')
-        self.assertEqual(self.owner.last_guidance_result['effective_command'],'switch_tool')
-
-    def test_missing_failed_object_name_holds_instead_of_guessing_target(self):
-        guide=self.owner.apply(self.command('refine',progress='failed',grasp_status='failed',target=''),42)
-        self.assertEqual(guide['tool'],'hold')
-        self.assertIn('missing_recovery_target',self.owner.last_guidance_result['guard_reason'])
-
-    def test_hold_does_not_erase_a_reported_acquisition_failure(self):
-        self.owner.apply(self.command('hold',tool='hold'),40)
-        guide=self.owner.apply(self.command('refine',revision=1,progress='failed',grasp_status='failed'),42)
-        self.assertEqual(guide['tool'],'grasp')
-
-    def test_failed_geometric_tool_allows_vla_recovery_without_forced_loop(self):
-        self.owner.recent_events.append({'executor':'grasp','args':{'target':'bread'},'status':'failed_above_target'})
-        guide=self.owner.apply(self.command('refine',progress='failed',grasp_status='failed'),42)
-        self.assertEqual(guide['tool'],'vla')
-        self.assertIn('already_failed',self.owner.last_guidance_result['guard_reason'])
-
-    def test_old_grasp_failure_does_not_abort_new_tool_preparation(self):
+    def test_normal_place_after_grasp_is_not_rejected_as_non_recovery(self):
         self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
-        self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'bread'},
-            progress='normal',grasp_status='failed'),41)
-        self.assertEqual(self.bus.guide['tool'],'grasp')
-        self.assertEqual(self.bus.guide['revision'],1)
-        self.assertEqual(self.owner.phase,'preparing')
-        self.assertFalse(self.owner.recent_events)
+        self.owner.phase='motion_done_unverified'
+        guide=self.owner.apply(self.command('switch_tool',tool='place',revision=1,
+            args={'destination':'bowl'},progress='normal',grasp_status='confirmed'),42)
+        self.assertEqual(guide['tool'],'place')
+        self.assertEqual(guide['args'],{'destination':'bowl'})
+        self.assertEqual(self.owner.last_guidance_result['status'],'applied')
 
-    def test_confirmed_holding_allows_transport(self):
-        guide=self.owner.apply(self.command('refine',instruction='carry bread to bowl',
-            stage='transport',grasp_status='confirmed'),42)
+    def test_failed_target_history_does_not_force_executor_choice(self):
+        self.owner.recent_events.append({'executor':'grasp','args':{'target':'bread'},'status':'failed_above_target'})
+        guide=self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),42)
+        self.assertEqual(guide['tool'],'grasp')
+        guide=self.owner.apply(self.command('refine',revision=1,progress='failed',grasp_status='failed'),43)
         self.assertEqual(guide['tool'],'vla')
-        self.assertEqual(guide['instruction'],'carry bread to bowl')
-
-    def test_place_tool_cannot_bypass_holding_requirement(self):
-        guide=self.owner.apply(self.command('switch_tool',tool='place',args={'destination':'bowl'}),42)
-        self.assertEqual(guide['tool'],'hold')
 
     def test_native_gripper_sign_and_rolling_buffer_are_explicit(self):
         self.owner.last_close=-.999212
@@ -197,7 +167,9 @@ class DuplexControlTests(unittest.TestCase):
         self.owner.actions.append(action)
         feedback=executor_feedback(self.bus.guide,self.owner,[.039,-.039],[0,0,0],20)
         self.assertEqual(feedback['gripper']['commanded'],'open')
-        self.assertEqual(feedback['gripper']['measured'],'open')
+        self.assertAlmostEqual(feedback['gripper']['finger_separation_m'],.078)
+        self.assertNotIn('measured',feedback['gripper'])
+        self.assertNotIn('holding_object',feedback['gripper'])
         self.assertEqual(feedback['action_buffer']['gripper_preview'],['close'])
         self.assertTrue(feedback['action_buffer']['auto_refilled'])
         self.assertFalse(feedback['action_buffer']['indicates_task_progress'])
@@ -205,8 +177,8 @@ class DuplexControlTests(unittest.TestCase):
         self.owner.last_close=.999
         feedback=executor_feedback(self.bus.guide,self.owner,[.0014,-.0013],[0,0,0],20)
         self.assertEqual(feedback['gripper']['commanded'],'close')
-        self.assertEqual(feedback['gripper']['measured'],'closed')
-        self.assertEqual(feedback['gripper']['holding_object'],'unverified')
+        self.assertAlmostEqual(feedback['gripper']['finger_separation_m'],.0027)
+        self.assertNotIn('measured',feedback['gripper'])
 
     def test_slow_vlm_does_not_block_capture_and_next_request_uses_latest_frame(self):
         entered=threading.Event();release=threading.Event();second=threading.Event()

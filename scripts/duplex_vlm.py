@@ -35,30 +35,23 @@ must remain unresolved in memory until visual evidence establishes recovery.
 VLA IS THE DEFAULT EXECUTOR and starts immediately with the native task
 instruction. Your first request does not block it. At step 0 there is no motion
 history: normally continue VLA, do not choose geometric grasp just because an
-object is visible. Use grasp/place only for recovery when you observe an anomaly
-or insufficient progress; report progress=failed or stalled with concrete visible
-evidence. After recovery, return ordinary task execution to VLA. Always name the
-current object in target and keep that name stable across retries. When VLA fails a grasp or makes insufficient progress
-on acquisition, TRY grasp with args.target immediately instead of repeatedly
-refining VLA. The executor also enforces this switch from your failure assessment.
-If the same target's grasp tool has already failed (see recent_executor_events),
-VLA recovery is allowed; do not loop blindly between two failed executors.
+object is visible. When you observe an anomaly or insufficient progress, consider
+grasp/place instead of repeatedly rewording a failed VLA instruction. You choose
+the executor and recovery sequence from images, recent outcomes and tool limits.
+The runtime does not force a grasp, a hold, or a VLA fallback from your progress,
+stage or grasp_status fields. Report those fields honestly; a place call after a
+successful tool grasp does not require reporting a new failure. Always name the
+current object in target and keep that name stable across retries. Use recent
+executor events to decide whether a tool retry or VLA recovery is appropriate.
 
-For a multi-stage task, guide only the current unresolved stage. Keep later
-stages in memory rather than combining grasp, transport and place into one
-instruction, including the first plan. Split each pick-and-place goal into
-acquire, verify holding, then transport/place. For stage=acquire, the instruction
-must stop at grasping and a small verification lift; do not include placing the
-target at its destination. If closed fingers are empty, explicitly open them
-before the retry. Before transport/place, require visual evidence that the
-target is held and follows the gripper; gripper closure or arm motion alone is
-not evidence. If the object remains behind, report grasp_status=failed or lost,
-return to stage=acquire, and select grasp recovery now. Do NOT continue a transport
-instruction after detecting a failed grasp. Reported failed/stalled VLA
-acquisition is routed to grasp, even if you return refine/continue. If target is
-missing it is held rather than guessing an object. Transport/place without
-confirmed visual holding is also held. These checks cannot detect failures you
-have not observed.
+For a multi-stage task, track unresolved stages and select useful instruction
+boundaries yourself. You can separate acquisition from transport when it helps
+resolve a failed grasp. Use images and the object's motion relative to the
+gripper to assess holding; a close command or finger spacing alone is not proof.
+If the object remains behind, correct the acquisition rather than continuing
+transport. Do not repeatedly pause for a ritual verification lift when the images
+already establish holding. Decide whether to continue, refine, hold or switch
+tools yourself; the executor does not turn unverified holding into a forced hold.
 
 Tools:
 - vla: official RoboCasa pi05, accepts a language instruction and all 3 cameras.
@@ -73,9 +66,13 @@ Tools:
   YOU verify visually that the object is held. It does not transport it.
   While preparing/approaching, not yet holding is expected: report unverified,
   not a new failed grasp merely because the previous VLA attempt failed.
+  This tool opens the gripper during clearance and approach. Calling it while
+  already holding an object can release that object; inspect the images first.
 - place: SAM3 + depth localize a visible support; closed-loop transport,
   lower, open and retreat. args={"destination":"short visible support name"}.
-  Use only after visual evidence that a grasp succeeded. Limited to reachable
+  It needs the held-object offset from a preceding geometric grasp; it cannot
+  directly place an object grasped only by VLA. Use VLA for that placement.
+  Use after visual evidence that a grasp succeeded. Limited to reachable
   supports; use vla for navigation/articulated or obstructed placements.
 - hold: retain position and last commanded gripper closure.
 
@@ -97,19 +94,21 @@ No simulator object coordinates, segmentation labels or success flags are given.
 SELECT RECOVERY EXECUTORS DYNAMICALLY. There is no fixed recovery tool schedule.
 Picking starts with VLA. Keep VLA when it is making visible progress.
 If it closes on empty space, leaves an object behind while starting transport,
-stalls, or repeats a failed grasp, select grasp before another VLA language-only
-retry, unless that target's grasp tool has already failed. Use SAM3/GraspGen when the
+stalls, or repeats a failed grasp, prefer an appropriate recovery tool over
+repeating the same ineffective VLA instruction. Use SAM3/GraspGen when the
 object is visible and the reachable geometric approach is appropriate. If a
-tool cannot detect the target, cannot converge, or cannot handle an articulated
-  interaction, switch back to VLA with the specific unresolved goal. Do not force
+tool fails, use its feedback and the images to choose a corrected retry or VLA
+with the specific unresolved goal. Do not force
 every available tool to be used. Explain each switch using observed evidence.
 Compare the previous external image, when supplied, with the current images;
 robot motion alone is not proof that the object or task made progress.
 
 Feedback semantics: gripper.commanded is explicitly open or close in the native
-interface. gripper.measured describes finger separation, NOT object possession;
-holding_object remains unverified until you establish visual evidence. Never
-infer grasp success just from a close command or closed fingers. action_buffer
+interface; it reports the command, not a measured finger state.
+gripper.finger_separation_m is a raw distance in meters, with no open/closed or
+grasp-success classification. A held object can keep the fingers separated;
+spacing alone cannot establish either holding or an empty grasp.
+Assess grasp success or failure from images, not a distance threshold. action_buffer
 is a rolling control buffer refilled by VLA, NOT a task/subgoal queue. Its length
 and draining do not indicate task progress. Do not wait for it to empty to verify
 a grasp. gripper_preview lists actual queued commands only. Read phase and

@@ -106,10 +106,7 @@ class ExecutionState:
             if guide['tool']=='grasp' and command.get('tool')!='grasp' and command.get('grasp_status') in {'failed','lost'}:
                 self.recent_events.append({'executor':'grasp','args':guide['args'],
                     'status':'visual_failure','step':step})
-            failed_targets={e['args']['target'].casefold() for e in self.recent_events
-                if e.get('executor')=='grasp' and e.get('args',{}).get('target') and
-                (e.get('status','').startswith('failed') or e.get('status')=='visual_failure')}
-            resolved=resolve_decision(command,guide,self.phase,failed_targets)
+            resolved=resolve_decision(command,guide,self.phase)
         except ValueError as exc:
             self.last_guidance_result={'status':'rejected','reason':str(exc),'requested_command':command['command']}
             self.log.emit('command_rejected',step=step,command=command,reason=str(exc))
@@ -119,7 +116,7 @@ class ExecutionState:
         self.last_visual_assessment['observed_step']=command.get('observed_step')
         self.last_guidance_result={'status':'applied','requested_command':command['command'],
             'effective_command':kind,'observed_step':command.get('observed_step'),
-            'applied_step':step,'guard_reason':resolved.get('guard_reason')}
+            'applied_step':step}
         if kind=='continue':
             self.exchange.describe(resolved['instruction'])
             self.log.emit('continue',step=step,revision=guide['revision'],reason=command.get('reason'),
@@ -137,7 +134,7 @@ class ExecutionState:
         self.applied_commands+=1
         self.log.emit('command_applied',step=step,previous_revision=previous,revision=guide['revision'],
             cleared_actions=count,delivery_latency_s=time.monotonic()-command['received_at'],
-            effective_command=kind,guard_reason=resolved.get('guard_reason'),command=command)
+            effective_command=kind,command=command)
         return guide
 
     def hold(self):
