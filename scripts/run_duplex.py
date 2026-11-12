@@ -27,6 +27,7 @@ from duplex_core import EventLog, Exchange, TimedVideo
 from duplex_contract import executor_feedback, resolve_decision
 from duplex_vlm import supervise
 from robocasa_tools import make_plan, MotionExecutor
+from whole_body import RobotKinematics
 
 
 def policy_wire(snapshot, instruction):
@@ -102,13 +103,19 @@ class ExecutionState:
             self.log.emit('command_discarded',reason='obsolete_revision',step=step,command=command)
             return None
         try:
-            resolved=resolve_decision(command,guide,self.phase)
+            if guide['tool']=='grasp' and command.get('tool')!='grasp' and command.get('grasp_status') in {'failed','lost'}:
+                self.recent_events.append({'executor':'grasp','args':guide['args'],
+                    'status':'visual_failure','step':step})
+            failed_targets={e['args']['target'].casefold() for e in self.recent_events
+                if e.get('executor')=='grasp' and e.get('args',{}).get('target') and
+                (e.get('status','').startswith('failed') or e.get('status')=='visual_failure')}
+            resolved=resolve_decision(command,guide,self.phase,failed_targets)
         except ValueError as exc:
             self.last_guidance_result={'status':'rejected','reason':str(exc),'requested_command':command['command']}
             self.log.emit('command_rejected',step=step,command=command,reason=str(exc))
             return None
         kind=resolved['command']
-        self.last_visual_assessment={k:resolved.get(k) for k in ['progress','grasp_status','stage','reason']}
+        self.last_visual_assessment={k:resolved.get(k) for k in ['progress','grasp_status','stage','target','reason']}
         self.last_visual_assessment['observed_step']=command.get('observed_step')
         self.last_guidance_result={'status':'applied','requested_command':command['command'],
             'effective_command':kind,'observed_step':command.get('observed_step'),
@@ -165,6 +172,7 @@ def main():
     if c.input_type!='delta' or c.input_ref_frame!='base' or c._goal_update_mode!='achieved':
         raise RuntimeError('Unexpected native controller contract')
     hz=float(raw.control_freq);period=1/hz
+    kinematics=RobotKinematics(robot,hz)
     horizon=int(get_task_horizon(args.task));limit=horizon/hz+20
     instruction=obs['annotation.human.task_description']
     log=EventLog(run/'duplex_events.jsonl')
@@ -178,7 +186,7 @@ def main():
         'mode':'duplex','initial_executor':'vla','tool_selection':'recovery_only',
         'env_step_s':0.,'hold_steps':0,'vla_steps':0,'tool_steps':0,
         'tools_available':['vla','sam3','graspgen','grasp','place'],
-        'motion_planner':'native_closed_loop_cartesian','recorder':'wall_clock_from_first_action'}
+        'motion_planner':'native_whole_body_differential_ik','recorder':'wall_clock_from_first_action'}
     start=time.monotonic();video=TimedVideo(run/'rollout_realtime.mp4',log) if args.video else None
     first_action=None
     site=robot.eef_site_id['right']
@@ -214,6 +222,7 @@ def main():
             'T_hand_to_site':np.linalg.inv(hand)@ee,
             'controller_origin_rot':c.origin_ori.copy(),
             'controller_scale':((c.output_max-c.output_min)/(c.input_max-c.input_min)).copy(),
+            'kinematics':kinematics.capture(),
             'feedback':executor_feedback(guide,execution,obs['state.gripper_qpos'],ee[:3,3],hz)}
 
     def wall_state(phase):

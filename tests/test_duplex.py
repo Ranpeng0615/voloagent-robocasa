@@ -29,7 +29,7 @@ class DuplexControlTests(unittest.TestCase):
         return {'command':command,'tool':tool,'based_revision':revision,'received_at':time.monotonic(),
                 'instruction':'retry grasping bread','args':{},
                 'progress':'stalled' if tool in {'grasp','place'} else 'normal',
-                'stage':'place' if tool=='place' else 'acquire','grasp_status':'unverified',
+                'stage':'place' if tool=='place' else 'acquire','grasp_status':'unverified','target':'bread',
                 'reason':'Object remained on its support over repeated observations',**extra}
 
     def test_refine_flushes_immediately_without_waiting_for_inflight_vla(self):
@@ -131,13 +131,15 @@ class DuplexControlTests(unittest.TestCase):
         self.assertEqual(self.bus.guide['tool'],'vla')
         self.assertEqual(len(self.owner.actions),1)
 
-    def test_failed_grasp_cannot_continue_unchanged_transport(self):
+    def test_failed_vla_grasp_clears_actions_and_switches_to_grasp(self):
         self.owner.actions.extend([np.ones(12) for _ in range(5)])
         guide=self.owner.apply(self.command('continue',instruction='pick bread',
             progress='failed',grasp_status='failed'),42)
-        self.assertEqual(guide['tool'],'hold')
+        self.assertEqual(guide['tool'],'grasp')
+        self.assertEqual(guide['args'],{'target':'bread'})
         self.assertFalse(self.owner.actions)
-        self.assertIn('reported_failure',self.owner.last_guidance_result['guard_reason'])
+        self.assertEqual(self.owner.phase,'preparing')
+        self.assertEqual(self.owner.last_guidance_result['guard_reason'],'failed_vla_grasp_try_grasp_tool')
 
     def test_unverified_transport_is_held_and_old_actions_invalidated(self):
         self.owner.actions.append(np.ones(12));self.owner.vla_pending=True
@@ -148,12 +150,36 @@ class DuplexControlTests(unittest.TestCase):
         self.assertFalse(self.owner.accepts(0,'vla',43))
         self.assertIn('holding_unverified',self.owner.last_guidance_result['guard_reason'])
 
-    def test_failed_grasp_can_be_refined_back_to_acquisition(self):
+    def test_failed_grasp_cannot_evade_tool_recovery_with_new_wording(self):
         guide=self.owner.apply(self.command('continue',instruction='open and regrasp bread only',
             progress='failed',grasp_status='failed',stage='acquire'),42)
+        self.assertEqual(guide['tool'],'grasp')
+        self.assertEqual(self.owner.last_guidance_result['effective_command'],'switch_tool')
+
+    def test_missing_failed_object_name_holds_instead_of_guessing_target(self):
+        guide=self.owner.apply(self.command('refine',progress='failed',grasp_status='failed',target=''),42)
+        self.assertEqual(guide['tool'],'hold')
+        self.assertIn('missing_recovery_target',self.owner.last_guidance_result['guard_reason'])
+
+    def test_hold_does_not_erase_a_reported_acquisition_failure(self):
+        self.owner.apply(self.command('hold',tool='hold'),40)
+        guide=self.owner.apply(self.command('refine',revision=1,progress='failed',grasp_status='failed'),42)
+        self.assertEqual(guide['tool'],'grasp')
+
+    def test_failed_geometric_tool_allows_vla_recovery_without_forced_loop(self):
+        self.owner.recent_events.append({'executor':'grasp','args':{'target':'bread'},'status':'failed_above_target'})
+        guide=self.owner.apply(self.command('refine',progress='failed',grasp_status='failed'),42)
         self.assertEqual(guide['tool'],'vla')
-        self.assertEqual(guide['instruction'],'open and regrasp bread only')
-        self.assertEqual(self.owner.last_guidance_result['effective_command'],'refine')
+        self.assertIn('already_failed',self.owner.last_guidance_result['guard_reason'])
+
+    def test_old_grasp_failure_does_not_abort_new_tool_preparation(self):
+        self.owner.apply(self.command('switch_tool',tool='grasp',args={'target':'bread'}),40)
+        self.owner.apply(self.command('continue',tool='grasp',revision=1,args={'target':'bread'},
+            progress='normal',grasp_status='failed'),41)
+        self.assertEqual(self.bus.guide['tool'],'grasp')
+        self.assertEqual(self.bus.guide['revision'],1)
+        self.assertEqual(self.owner.phase,'preparing')
+        self.assertFalse(self.owner.recent_events)
 
     def test_confirmed_holding_allows_transport(self):
         guide=self.owner.apply(self.command('refine',instruction='carry bread to bowl',

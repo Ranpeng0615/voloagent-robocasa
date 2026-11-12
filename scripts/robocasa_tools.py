@@ -17,6 +17,7 @@ from vlm_orchestrator.grasp.camera import CameraIntrinsics, depth_to_pointcloud
 from vlm_orchestrator.grasp.tool import (
     LIBERO_GRASPGEN_TO_EE_YAW_RAD, PRE_GRASP_OFFSET, RETREAT_HEIGHT,
 )
+from whole_body import whole_body_action
 
 
 @dataclass
@@ -80,7 +81,8 @@ def make_plan(guide, snapshot, log, held_offset=None, client=None):
     log.emit('sam3_result',tool=name,target=target,score=score,mask_pixels=int(mask.sum()),box=box,
              duration_s=time.monotonic()-start,revision=guide['revision'])
     evidence = {'target':target,'camera':camera,'sam3_score':score,'mask_pixels':int(mask.sum()),'box':list(box),
-                'observed_step':snapshot['step'],'perception_world_center':center.tolist()}
+                'observed_step':snapshot['step'],'perception_world_center':center.tolist(),
+                'motion_solver':'whole_body_differential_ik' if 'kinematics' in snapshot else 'arm_osc'}
     artifacts=Path(os.environ['RUN_DIR'])/'tool_assets';artifacts.mkdir(exist_ok=True)
     prefix=artifacts/f'revision_{guide["revision"]}_{name}'
     np.savez_compressed(prefix.with_suffix('.npz'),rgb=snapshot['left'],mask=mask,
@@ -143,6 +145,8 @@ class MotionExecutor:
         self.reached = None
         self.status = 'moving'
         self.tracking_error = {}
+        self.ik_diagnostics={}
+        self.base_anchor=None
 
     @property
     def phase(self):
@@ -154,7 +158,7 @@ class MotionExecutor:
         goal = self.plan.waypoints[self.index]
         dp = goal.pos-snapshot['ee_pos']
         dr_world = Rotation.from_matrix(goal.rot@snapshot['ee_rot'].T).as_rotvec()
-        self.tracking_error={'position_m':float(np.linalg.norm(dp)),
+        self.tracking_error={**self.ik_diagnostics,'position_m':float(np.linalg.norm(dp)),
             'rotation_rad':float(np.linalg.norm(dr_world))}
         position_tolerance=.009 if goal.phase in {'approach','close','lower','release'} else .020
         rotation_tolerance=.12 if goal.phase in {'approach','close','lower','release'} else .20
@@ -174,6 +178,13 @@ class MotionExecutor:
             self.status='failed_'+goal.phase
             self.index=len(self.plan.waypoints)
             return None
+        if 'kinematics' in snapshot:
+            if self.base_anchor is None:self.base_anchor=snapshot['kinematics']['q'][:3].copy()
+            action,diagnostics=whole_body_action(snapshot,dp,dr_world,goal.close,self.base_anchor,
+                base_enabled=goal.phase not in {'close','release'})
+            self.tracking_error.update(diagnostics)
+            self.ik_diagnostics=diagnostics
+            return action
         # Native OSC takes deltas in the controller's BASE reference frame.
         origin=snapshot['controller_origin_rot']
         delta_pos=origin.T@dp
